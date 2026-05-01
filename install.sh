@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_NAME="aitrace"
 DEFAULT_GIT_URL="https://github.com/yuzeguitarist/aitrace.git"
-GIT_URL="${AITRACE_GIT_URL:-$DEFAULT_GIT_URL}"
+GIT_URL="${DEFAULT_GIT_URL}"
 INSTALL_ROOT="${AITRACE_INSTALL_ROOT:-${HOME}/.aitrace-src}"
 SRC_DIR="${INSTALL_ROOT}/${APP_NAME}"
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
@@ -18,7 +18,7 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/Cargo.toml" && -z "${AITRACE_GIT_URL:-}" ]]; then
+if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/Cargo.toml" ]]; then
   SRC_DIR="${SCRIPT_DIR}"
   echo "Installing from local source ${SRC_DIR}..."
 elif [[ -d "${SRC_DIR}/.git" ]]; then

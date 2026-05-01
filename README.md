@@ -67,12 +67,6 @@ Install from the public GitHub repo:
 curl -fsSL https://raw.githubusercontent.com/yuzeguitarist/aitrace/main/install.sh | bash
 ```
 
-For private repos or a non-default URL:
-
-```bash
-AITRACE_GIT_URL="https://github.com/yuzeguitarist/aitrace.git" bash install.sh
-```
-
 The script builds with `cargo install --path` and installs the `aitrace` binary
 into Cargo's bin directory, usually `~/.cargo/bin`.
 

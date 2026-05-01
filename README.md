@@ -35,7 +35,6 @@ MCP is intentionally left for a later version.
 
 - macOS
 - Xcode command line tools with `xcrun xctrace`
-- Rust toolchain for source install (`cargo`)
 
 Check your machine:
 
@@ -45,30 +44,15 @@ aitrace doctor
 
 ## Install
 
-### Local source install
-
-From this repo:
-
-```bash
-bash install.sh
-```
-
-Then:
-
-```bash
-aitrace doctor
-```
-
-### One-command install script
-
-Install from the public GitHub repo:
+Install the latest prebuilt macOS binary from GitHub Releases:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yuzeguitarist/aitrace/main/install.sh | bash
 ```
 
-The script builds with `cargo install --path` and installs the `aitrace` binary
-into Cargo's bin directory, usually `~/.cargo/bin`.
+The script detects Apple Silicon vs Intel Mac, downloads the matching release
+asset, verifies its checksum when available, and installs `aitrace` into a local
+bin directory. No Rust toolchain or repository clone is required.
 
 ## Quick start
 
@@ -193,11 +177,34 @@ In AI mode (`--format ai-yaml`, the default):
 
 ## Development
 
+Build from source:
+
+```bash
+cargo install --path .
+```
+
+Run checks:
+
 ```bash
 cargo fmt
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+## Release
+
+Create and push a version tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+GitHub Actions builds precompiled macOS binaries for Apple Silicon and Intel,
+then uploads these assets to the GitHub Release:
+
+- `aitrace-aarch64-apple-darwin.tar.gz`
+- `aitrace-x86_64-apple-darwin.tar.gz`
 
 The current parser is intentionally conservative: it indexes useful schemas
 selected from `xctrace export --toc`, stores raw table/row evidence compressed,

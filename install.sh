@@ -2,47 +2,93 @@
 set -euo pipefail
 
 APP_NAME="aitrace"
-DEFAULT_GIT_URL="https://github.com/yuzeguitarist/aitrace.git"
-GIT_URL="${DEFAULT_GIT_URL}"
-INSTALL_ROOT="${AITRACE_INSTALL_ROOT:-${HOME}/.aitrace-src}"
-SRC_DIR="${INSTALL_ROOT}/${APP_NAME}"
-SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
-SCRIPT_DIR=""
+REPO="yuzeguitarist/aitrace"
+BASE_URL="https://github.com/${REPO}/releases/latest/download"
 
-if [[ -n "${SCRIPT_PATH}" && -f "${SCRIPT_PATH}" ]]; then
-  SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" >/dev/null 2>&1 && pwd)"
-fi
-
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "error: cargo is required. Install Rust first: https://rustup.rs/" >&2
+if ! command -v curl >/dev/null 2>&1; then
+  echo "error: curl is required to download ${APP_NAME}." >&2
   exit 1
 fi
 
-if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/Cargo.toml" ]]; then
-  SRC_DIR="${SCRIPT_DIR}"
-  echo "Installing from local source ${SRC_DIR}..."
-elif [[ -d "${SRC_DIR}/.git" ]]; then
-  if ! command -v git >/dev/null 2>&1; then
-    echo "error: git is required to update ${SRC_DIR}." >&2
-    exit 1
+case "$(uname -s)" in
+Darwin) ;;
+*)
+  echo "error: ${APP_NAME} currently supports macOS only." >&2
+  exit 1
+  ;;
+esac
+
+case "$(uname -m)" in
+arm64 | aarch64)
+  TARGET="aarch64-apple-darwin"
+  ;;
+x86_64)
+  TARGET="x86_64-apple-darwin"
+  ;;
+*)
+  echo "error: unsupported CPU architecture: $(uname -m)" >&2
+  exit 1
+  ;;
+esac
+
+choose_bin_dir() {
+  if [[ -n "${AITRACE_BIN_DIR:-}" ]]; then
+    printf '%s\n' "${AITRACE_BIN_DIR}"
+    return
   fi
-  echo "Updating ${SRC_DIR}..."
-  git -C "${SRC_DIR}" pull --ff-only
-else
-  if ! command -v git >/dev/null 2>&1; then
-    echo "error: git is required to clone ${GIT_URL}." >&2
-    exit 1
-  fi
-  mkdir -p "${INSTALL_ROOT}"
-  echo "Cloning ${GIT_URL} into ${SRC_DIR}..."
-  git clone "${GIT_URL}" "${SRC_DIR}"
+
+  local dir
+  for dir in "${HOME}/.local/bin" "${HOME}/bin" "/opt/homebrew/bin" "/usr/local/bin"; do
+    case ":${PATH}:" in
+    *":${dir}:"*)
+      if [[ -d "${dir}" && -w "${dir}" ]]; then
+        printf '%s\n' "${dir}"
+        return
+      fi
+      ;;
+    esac
+  done
+
+  printf '%s\n' "${HOME}/.local/bin"
+}
+
+BIN_DIR="$(choose_bin_dir)"
+ASSET="${APP_NAME}-${TARGET}.tar.gz"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "${TMP_DIR}"' EXIT
+
+echo "Downloading ${APP_NAME} for ${TARGET}..."
+if ! curl -fsSL "${BASE_URL}/${ASSET}" -o "${TMP_DIR}/${ASSET}"; then
+  echo "error: failed to download ${BASE_URL}/${ASSET}" >&2
+  echo "The latest GitHub release may not have a prebuilt binary for ${TARGET} yet." >&2
+  exit 1
 fi
 
-echo "Installing ${APP_NAME}..."
-cargo install --path "${SRC_DIR}" --force
+if curl -fsSL "${BASE_URL}/${ASSET}.sha256" -o "${TMP_DIR}/${ASSET}.sha256"; then
+  if command -v shasum >/dev/null 2>&1; then
+    (cd "${TMP_DIR}" && shasum -a 256 -c "${ASSET}.sha256")
+  else
+    echo "warning: shasum not found; skipping checksum verification." >&2
+  fi
+else
+  echo "warning: checksum file not found; skipping checksum verification." >&2
+fi
+
+tar -xzf "${TMP_DIR}/${ASSET}" -C "${TMP_DIR}"
+if [[ ! -x "${TMP_DIR}/${APP_NAME}" ]]; then
+  echo "error: archive did not contain an executable ${APP_NAME} binary." >&2
+  exit 1
+fi
+
+mkdir -p "${BIN_DIR}"
+install -m 0755 "${TMP_DIR}/${APP_NAME}" "${BIN_DIR}/${APP_NAME}"
 
 echo
-echo "Installed:"
-command -v "${APP_NAME}" || true
+echo "Installed ${APP_NAME} to ${BIN_DIR}/${APP_NAME}"
+if ! command -v "${APP_NAME}" >/dev/null 2>&1; then
+  echo
+  echo "Add this to your shell profile if ${APP_NAME} is not found:"
+  echo "  export PATH=\"${BIN_DIR}:\$PATH\""
+fi
 echo
-"${APP_NAME}" doctor || true
+"${BIN_DIR}/${APP_NAME}" doctor || true

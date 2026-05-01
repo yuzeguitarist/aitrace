@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create or reuse release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists."
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes "Prebuilt macOS binaries for aitrace."
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package release asset
+        run: |
+          set -euo pipefail
+          asset="aitrace-${{ matrix.target }}.tar.gz"
+          mkdir -p package
+          cp "target/${{ matrix.target }}/release/aitrace" package/aitrace
+          chmod 0755 package/aitrace
+          cp README.md LICENSE package/
+          tar -czf "${asset}" -C package aitrace README.md LICENSE
+          shasum -a 256 "${asset}" > "${asset}.sha256"
+
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "${GITHUB_REF_NAME}" \
+            "aitrace-${{ matrix.target }}.tar.gz" \
+            "aitrace-${{ matrix.target }}.tar.gz.sha256" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber

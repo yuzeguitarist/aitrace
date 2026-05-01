@@ -1,5 +1,8 @@
 # Rust build artifacts
 /target/
+/dist/
+*.tar.gz
+*.sha256
 
 # aitrace local caches / generated databases
 /.aitrace-cache/

@@ -78,10 +78,13 @@ into Cargo's bin directory, usually `~/.cargo/bin`.
 
 ## Quick start
 
+Start with a local `.trace` bundle in the current folder, for example
+`Deck.trace`.
+
 Preferred AI one-shot command:
 
 ```bash
-aitrace diagnose /path/to/Deck.trace --target Deck --repo /path/to/Deck --budget 1800
+aitrace diagnose Deck.trace --target Deck --repo . --budget 1800
 ```
 
 `diagnose` defaults to `--run latest` so a giant multi-run trace does not
@@ -97,50 +100,39 @@ silently index every run. It prints compact RCA lines only:
 Inspect a trace without exporting giant XML into the AI context:
 
 ```bash
-aitrace inspect /path/to/Deck.trace --format ai-yaml
+aitrace inspect Deck.trace --format ai-yaml
 ```
 
-Build the cache:
+`summary`, `find`, `drill`, and `raw` auto-build the cache when needed. Use
+targeted summaries for follow-up:
 
 ```bash
-aitrace index /path/to/Deck.trace --preset cpu
-```
-
-Get the small AI summary:
-
-```bash
-aitrace summary /path/to/Deck.trace --preset cpu --target Deck --budget 1200
+aitrace summary Deck.trace --preset cpu --target Deck --run latest --budget 1200
 ```
 
 For Energy Organizer / Activity Monitor style traces:
 
 ```bash
-aitrace summary /path/to/Deck.trace --preset energy --target Deck --budget 1600
+aitrace summary Deck.trace --preset energy --target Deck --run latest --budget 1600
 ```
 
 For mixed system/runtime traces that contain GCD, syscall, thread-state,
 runloop, region-of-interest, or narrative tables:
 
 ```bash
-aitrace summary /path/to/Deck.trace --preset diagnostics --target Deck --budget 1600
+aitrace summary Deck.trace --preset diagnostics --target Deck --run latest --budget 1600
 ```
 
 Drill into a finding:
 
 ```bash
-aitrace drill /path/to/Deck.trace cpu.hotspot.1 --depth 8 --budget 1000
-```
-
-Or drill by exact evidence ID:
-
-```bash
-aitrace drill /path/to/Deck.trace ev:cpu:run1:table53:row4428 --depth 8
+aitrace drill Deck.trace cpu.hotspot.1 --preset cpu --depth 8 --budget 1000
 ```
 
 Print bounded raw evidence only when necessary:
 
 ```bash
-aitrace raw /path/to/Deck.trace ev:cpu:run1:table53:row4428 --context 4 --budget 4000
+aitrace raw Deck.trace ev:cpu:run1:table53:row4428 --context 4 --budget 4000
 ```
 
 ## AI agent usage rule
@@ -149,24 +141,24 @@ Put this in `AGENTS.md` / project instructions for Codex, Claude Code, Cursor,
 or other terminal-using agents:
 
 ```md
-When analyzing Apple Instruments `.trace` files, never run `xctrace` directly
-and never `cat` exported XML.
+When analyzing Apple Instruments `.trace` bundles:
 
-Use:
-
-- `aitrace doctor`
-- `aitrace diagnose <trace> --target <AppName> --repo <repo> --budget 1800`
-- `aitrace inspect <trace> --format ai-yaml`
-- `aitrace summary <trace> --preset cpu --target <AppName> --budget 1200`
-- `aitrace summary <trace> --preset diagnostics --target <AppName> --budget 1600`
-- `aitrace summary <trace> --preset energy --target <AppName> --budget 1600`
-- `aitrace summary <trace> --preset hangs --target <AppName> --budget 1200`
-- `aitrace find <trace> --symbol <SymbolName> --budget 1200`
-- `aitrace drill <trace> <finding-or-evidence-id> --depth 8 --budget 1000`
-- `aitrace raw <trace> <evidence-id> --context 4 --budget 4000`
-
-Only use `aitrace export` for parser debugging.
-Do not paste raw `xctrace` XML into model context.
+1. Do not run `xcrun xctrace` directly, and do not paste exported XML into the
+   model context.
+2. If the environment is unknown, run `aitrace doctor` first.
+3. Start with `aitrace diagnose TRACE.trace --target APP --repo . --budget 1800`.
+   `diagnose` defaults to `--run latest`; use `--run all` only when explicitly
+   needed.
+4. If the trace contents are unknown, run
+   `aitrace inspect TRACE.trace --format ai-yaml`.
+5. Use targeted follow-up summaries, usually with `--run latest`:
+   - `aitrace summary TRACE.trace --preset cpu --target APP --run latest --budget 1200`
+   - `aitrace summary TRACE.trace --preset diagnostics --target APP --run latest --budget 1600`
+   - `aitrace summary TRACE.trace --preset energy --target APP --run latest --budget 1600`
+   - `aitrace summary TRACE.trace --preset hangs --target APP --run latest --budget 1200`
+6. Use `aitrace find`, `aitrace drill`, and `aitrace raw` only with symbols,
+   finding IDs, or evidence IDs produced by `aitrace`.
+7. Use `aitrace export` only for parser debugging, never as the normal AI loop.
 ```
 
 ## Cache
@@ -183,14 +175,14 @@ to `${TMPDIR}/aitrace-cache`.
 Override with:
 
 ```bash
-export AITRACE_CACHE_DIR=/path/to/cache
+export AITRACE_CACHE_DIR="$HOME/aitrace-cache"
 ```
 
 The cache key includes trace metadata, parser version, and the detected
 `xctrace` version. Rebuild explicitly:
 
 ```bash
-aitrace index /path/to/Deck.trace --force
+aitrace index Deck.trace --force
 ```
 
 ## Output contract
@@ -204,19 +196,6 @@ In AI mode (`--format ai-yaml`, the default):
 - every summary finding contains an `evidence` ID
 - every finding includes a suggested next command
 - `raw` output is budget-limited
-
-## GitHub hosting
-
-Recommended first push:
-
-```bash
-git init
-git add .
-git commit -m "Initial aitrace CLI"
-gh repo create aitrace --public --source=. --remote=origin --push
-```
-
-The current public repo URL is `https://github.com/yuzeguitarist/aitrace`.
 
 ## Development
 

@@ -1,0 +1,39 @@
+# Rust build artifacts
+/target/
+
+# aitrace local caches / generated databases
+/.aitrace-cache/
+/aitrace-cache/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Instruments trace bundles and exported local analysis artifacts
+*.trace/
+**/*.trace/
+*.xcresult/
+*.xccrashpoint/
+
+# Logs, temp files, and local-only environment files
+*.log
+*.tmp
+*.temp
+.env
+.env.*
+!.env.example
+.cache/
+.tmp/
+tmp/
+
+# Editor / IDE local state
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS / filesystem noise
+.DS_Store
+._*
+Thumbs.db

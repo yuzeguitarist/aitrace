@@ -61,16 +61,16 @@ aitrace doctor
 
 ### One-command install script
 
-After this code is pushed to GitHub, install from a repo URL:
+Install from the public GitHub repo:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/aitrace/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/yuzeguitarist/aitrace/main/install.sh | bash
 ```
 
 For private repos or a non-default URL:
 
 ```bash
-AITRACE_GIT_URL="https://github.com/<owner>/aitrace.git" bash install.sh
+AITRACE_GIT_URL="https://github.com/yuzeguitarist/aitrace.git" bash install.sh
 ```
 
 The script builds with `cargo install --path` and installs the `aitrace` binary
@@ -213,10 +213,10 @@ Recommended first push:
 git init
 git add .
 git commit -m "Initial aitrace CLI"
-gh repo create aitrace --private --source=. --remote=origin --push
+gh repo create aitrace --public --source=. --remote=origin --push
 ```
 
-Then replace `<owner>` in the install command with your GitHub owner.
+The current public repo URL is `https://github.com/yuzeguitarist/aitrace`.
 
 ## Development
 
@@ -230,3 +230,7 @@ The current parser is intentionally conservative: it indexes useful schemas
 selected from `xctrace export --toc`, stores raw table/row evidence compressed,
 and scores XML rows generically. Future versions can add schema-specific parsers
 for Time Profiler call trees, hangs, allocations, signposts, and OSLog.
+
+## License
+
+MIT © 2026 Yuze Pan

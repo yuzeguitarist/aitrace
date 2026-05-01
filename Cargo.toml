@@ -2,6 +2,7 @@
 name = "aitrace"
 version = "0.1.0"
 edition = "2021"
+authors = ["Yuze Pan"]
 description = "AI-friendly CLI analyzer for Apple Instruments .trace bundles"
 license = "MIT"
 repository = "https://github.com/yuzeguitarist/aitrace"

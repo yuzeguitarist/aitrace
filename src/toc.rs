@@ -9,8 +9,11 @@ use std::io::Cursor;
 #[derive(Debug, Clone, Serialize)]
 pub struct RunRef {
     pub number: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target_pid: Option<String>,
 }
 
@@ -19,7 +22,9 @@ pub struct SchemaRef {
     pub run: String,
     pub table_index: usize,
     pub schema_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub documentation: Option<String>,
     pub suggested_xpath: String,
 }
@@ -38,6 +43,13 @@ struct TableContext {
     documentation: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct TrackContext {
+    index: usize,
+    name: String,
+    detail_index: usize,
+}
+
 pub fn parse_toc(xml: &[u8]) -> Result<Toc> {
     let mut reader = Reader::from_reader(Cursor::new(xml));
     reader.config_mut().trim_text(true);
@@ -48,12 +60,15 @@ pub fn parse_toc(xml: &[u8]) -> Result<Toc> {
 
     let mut current_run = "1".to_string();
     let mut table_index = 0usize;
+    let mut track_index = 0usize;
     let mut table_stack: Vec<TableContext> = Vec::new();
+    let mut track_stack: Vec<TrackContext> = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(e) if e.name().as_ref() == b"run" => {
                 table_index = 0;
+                track_index = 0;
                 current_run = attr(&e, b"number")
                     .or_else(|| attr(&e, b"id"))
                     .unwrap_or_else(|| (runs.len() + 1).to_string());
@@ -94,6 +109,17 @@ pub fn parse_toc(xml: &[u8]) -> Result<Toc> {
             Event::End(e) if e.name().as_ref() == b"table" => {
                 table_stack.pop();
             }
+            Event::Start(e) if e.name().as_ref() == b"track" => {
+                track_index += 1;
+                track_stack.push(TrackContext {
+                    index: track_index,
+                    name: attr(&e, b"name").unwrap_or_else(|| format!("Track {track_index}")),
+                    detail_index: 0,
+                });
+            }
+            Event::End(e) if e.name().as_ref() == b"track" => {
+                track_stack.pop();
+            }
             Event::Empty(e) if e.name().as_ref() == b"table" => {
                 table_index += 1;
                 let schema = attr(&e, b"schema")
@@ -110,6 +136,27 @@ pub fn parse_toc(xml: &[u8]) -> Result<Toc> {
                             .or_else(|| attr(&e, b"description")),
                         suggested_xpath: xpath_for(&current_run, idx, schema.as_deref()),
                     });
+                }
+            }
+            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"detail" => {
+                if let Some(track) = track_stack.last_mut() {
+                    track.detail_index += 1;
+                    if attr(&e, b"kind").as_deref() == Some("table") {
+                        let detail_name = attr(&e, b"name")
+                            .unwrap_or_else(|| format!("Detail {}", track.detail_index));
+                        schemas.push(SchemaRef {
+                            run: current_run.clone(),
+                            table_index: synthetic_detail_index(track.index, track.detail_index),
+                            schema_name: synthetic_detail_schema(&track.name, &detail_name),
+                            name: Some(format!("{} / {}", track.name, detail_name)),
+                            documentation: Some("Track detail table".to_string()),
+                            suggested_xpath: track_detail_xpath(
+                                &current_run,
+                                &track.name,
+                                &detail_name,
+                            ),
+                        });
+                    }
                 }
             }
             Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"schema" => {
@@ -187,6 +234,38 @@ pub fn xpath_for(run: &str, table_index: usize, schema: Option<&str>) -> String 
     )
 }
 
+fn synthetic_detail_index(track_index: usize, detail_index: usize) -> usize {
+    10_000 + track_index * 100 + detail_index
+}
+
+fn synthetic_detail_schema(track_name: &str, detail_name: &str) -> String {
+    format!("{}.{}", slug(track_name), slug(detail_name))
+}
+
+fn track_detail_xpath(run: &str, track_name: &str, detail_name: &str) -> String {
+    format!(
+        "/trace-toc/run[@number='{}']/tracks/track[@name='{}']/details/detail[@name='{}']",
+        escape_xpath(run),
+        escape_xpath(track_name),
+        escape_xpath(detail_name)
+    )
+}
+
+fn slug(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for c in value.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.extend(c.to_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
 fn escape_xpath(input: &str) -> Cow<'_, str> {
     if input.contains('\'') {
         Cow::Owned(input.replace('\'', "&apos;"))
@@ -235,5 +314,24 @@ mod tests {
         assert_eq!(toc.schemas.len(), 2);
         assert_eq!(toc.schemas[0].schema_name, "cpu-profile");
         assert!(toc.schemas[0].suggested_xpath.contains("cpu-profile"));
+    }
+
+    #[test]
+    fn parses_track_detail_tables() {
+        let xml = br#"
+        <trace-toc>
+          <run number="1">
+            <tracks>
+              <track name="Allocations">
+                <details>
+                  <detail name="Statistics" kind="table"/>
+                </details>
+              </track>
+            </tracks>
+          </run>
+        </trace-toc>"#;
+        let toc = parse_toc(xml).unwrap();
+        assert_eq!(toc.schemas[0].schema_name, "allocations.statistics");
+        assert!(toc.schemas[0].suggested_xpath.contains("Allocations"));
     }
 }

@@ -78,6 +78,9 @@ pub fn run(format: OutputFormat) -> Result<()> {
         supported_presets: vec![
             "overview",
             "cpu",
+            "cpu-counters",
+            "thread-state",
+            "poi",
             "diagnostics",
             "energy",
             "hangs",

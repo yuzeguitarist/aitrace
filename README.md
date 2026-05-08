@@ -23,7 +23,7 @@ This repository contains the first CLI version:
 - `aitrace diagnose`
 - `aitrace inspect`
 - `aitrace index`
-- `aitrace summary --preset cpu|diagnostics|energy|hangs|memory|oslog`
+- `aitrace summary --preset cpu|cpu-counters|thread-state|poi|diagnostics|energy|hangs|memory|oslog`
 - `aitrace find`
 - `aitrace drill`
 - `aitrace raw`
@@ -94,6 +94,23 @@ For Energy Organizer / Activity Monitor style traces:
 aitrace summary Deck.trace --preset energy --target Deck --run latest --budget 1600
 ```
 
+For CPU Bottlenecks templates that contain CPU Counters, Time Profiler, Thread
+State Trace, and Points of Interest, use separate compact summaries instead of
+one giant mixed export:
+
+```bash
+aitrace summary Deck.trace --preset cpu --target Deck --run latest --budget 1200
+aitrace summary Deck.trace --preset cpu-counters --target Deck --run latest --budget 1200
+aitrace summary Deck.trace --preset thread-state --target Deck --run latest --budget 1200
+aitrace summary Deck.trace --preset poi --target Deck --run latest --budget 1200
+```
+
+For Allocations / VM Tracker traces:
+
+```bash
+aitrace summary Memory.trace --preset memory --target Deck --run latest --budget 1200
+```
+
 For mixed system/runtime traces that contain GCD, syscall, thread-state,
 runloop, region-of-interest, or narrative tables:
 
@@ -131,9 +148,13 @@ When analyzing Apple Instruments `.trace` bundles:
    `aitrace inspect TRACE.trace --format ai-yaml`.
 5. Use targeted follow-up summaries, usually with `--run latest`:
    - `aitrace summary TRACE.trace --preset cpu --target APP --run latest --budget 1200`
+   - `aitrace summary TRACE.trace --preset cpu-counters --target APP --run latest --budget 1200`
+   - `aitrace summary TRACE.trace --preset thread-state --target APP --run latest --budget 1200`
+   - `aitrace summary TRACE.trace --preset poi --target APP --run latest --budget 1200`
    - `aitrace summary TRACE.trace --preset diagnostics --target APP --run latest --budget 1600`
    - `aitrace summary TRACE.trace --preset energy --target APP --run latest --budget 1600`
    - `aitrace summary TRACE.trace --preset hangs --target APP --run latest --budget 1200`
+   - `aitrace summary TRACE.trace --preset memory --target APP --run latest --budget 1200`
 6. Use `aitrace find`, `aitrace drill`, and `aitrace raw` only with symbols,
    finding IDs, or evidence IDs produced by `aitrace`.
 7. Use `aitrace export` only for parser debugging, never as the normal AI loop.
@@ -168,6 +189,7 @@ aitrace index Deck.trace --force
 In AI mode (`--format ai-yaml`, the default):
 
 - stdout contains only structured result data
+- `inspect` uses short schema keys (`r`, `i`, `s`, `n`) by default
 - `diagnose` intentionally uses short keys and line strings to minimize tokens
 - `xctrace` stderr is compacted into normalized errors
 - full XML is never printed by `summary`/`find`/`drill`
@@ -196,8 +218,8 @@ cargo clippy --all-targets -- -D warnings
 Create and push a version tag:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 GitHub Actions builds precompiled macOS binaries for Apple Silicon and Intel,
@@ -206,10 +228,10 @@ then uploads these assets to the GitHub Release:
 - `aitrace-aarch64-apple-darwin.tar.gz`
 - `aitrace-x86_64-apple-darwin.tar.gz`
 
-The current parser is intentionally conservative: it indexes useful schemas
-selected from `xctrace export --toc`, stores raw table/row evidence compressed,
-and scores XML rows generically. Future versions can add schema-specific parsers
-for Time Profiler call trees, hangs, allocations, signposts, and OSLog.
+The parser indexes useful schemas selected from `xctrace export --toc`, stores
+raw table/row evidence compressed, and includes compact schema-aware summaries
+for Time Profiler, CPU counters, thread state, points of interest, and
+Allocations / VM Tracker statistics.
 
 ## License
 

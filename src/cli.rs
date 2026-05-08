@@ -263,10 +263,13 @@ pub enum OutputFormat {
 pub enum Preset {
     Overview,
     Cpu,
+    CpuCounters,
     Diagnostics,
     Energy,
     Hangs,
     Memory,
+    Poi,
+    ThreadState,
     Oslog,
 }
 
@@ -275,10 +278,13 @@ impl Preset {
         match self {
             Preset::Overview => "overview",
             Preset::Cpu => "cpu",
+            Preset::CpuCounters => "cpu-counters",
             Preset::Diagnostics => "diagnostics",
             Preset::Energy => "energy",
             Preset::Hangs => "hangs",
             Preset::Memory => "memory",
+            Preset::Poi => "poi",
+            Preset::ThreadState => "thread-state",
             Preset::Oslog => "oslog",
         }
     }
@@ -292,6 +298,13 @@ impl Preset {
                 "time profiler",
                 "sample",
                 "call tree",
+            ],
+            Preset::CpuCounters => &[
+                "countermetric",
+                "cpu counters",
+                "coretypebyprocess",
+                "remarksbycore",
+                "kdebug-counters",
             ],
             Preset::Diagnostics => &[
                 "gcd-perf-event",
@@ -334,6 +347,23 @@ impl Preset {
                 "memory",
                 "regions",
             ],
+            Preset::Poi => &[
+                "global-poi-layout",
+                "global-roi-layout",
+                "kdebug-signpost",
+                "os-signpost",
+                "points-of-interest",
+                "region-of-interest",
+                "roi-metadata",
+            ],
+            Preset::ThreadState => &[
+                "context-switch",
+                "cpu-narrative",
+                "cpu-state",
+                "thread-narrative",
+                "thread-snapshot",
+                "thread-state",
+            ],
             Preset::Oslog => &["os-log", "signpost", "points-of-interest", "logging"],
         }
     }
@@ -341,10 +371,13 @@ impl Preset {
     pub fn all_index_presets() -> &'static [Preset] {
         &[
             Preset::Cpu,
+            Preset::CpuCounters,
+            Preset::ThreadState,
+            Preset::Poi,
+            Preset::Memory,
             Preset::Diagnostics,
             Preset::Energy,
             Preset::Hangs,
-            Preset::Memory,
             Preset::Oslog,
         ]
     }

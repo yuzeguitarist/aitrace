@@ -22,9 +22,18 @@ struct InspectOutput {
     kind: &'static str,
     trace: String,
     runs: Vec<crate::toc::RunRef>,
-    schemas: Vec<SchemaRef>,
+    schemas: Vec<InspectSchema>,
     available_views: Vec<String>,
     recommended_next: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectSchema {
+    r: String,
+    i: usize,
+    s: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -55,9 +64,13 @@ struct SummaryOutput {
     kind: &'static str,
     trace: String,
     preset: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     run: Option<String>,
-    cache_db: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_db: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     thread: Option<String>,
     coverage: Coverage,
     findings: Vec<Finding>,
@@ -103,11 +116,16 @@ struct Finding {
     id: String,
     severity: &'static str,
     title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     module: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     thread: Option<String>,
     score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     percent_hint: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     time_ms_hint: Option<f64>,
     schema: String,
     evidence: String,
@@ -163,9 +181,12 @@ struct ParsedRow {
 pub fn inspect(trace: PathBuf, format: OutputFormat, limit: usize) -> Result<()> {
     validate_trace(&trace)?;
     let toc_xml = xctrace::export_toc(&trace)?;
-    let mut toc = toc::parse_toc(&toc_xml)?;
-    toc.schemas.truncate(limit);
+    let toc = toc::parse_toc(&toc_xml)?;
     let available_views = available_views(&toc.schemas);
+    let available_views = prioritize_views_for_trace(available_views, &toc.schemas);
+    let runs = toc.runs;
+    let mut schemas = toc.schemas;
+    schemas.truncate(limit);
     let trace_s = trace.display().to_string();
     let mut recommended_next = available_views
         .iter()
@@ -188,8 +209,16 @@ pub fn inspect(trace: PathBuf, format: OutputFormat, limit: usize) -> Result<()>
     let output = InspectOutput {
         kind: "aitrace.inspect.v1",
         trace: trace_s.clone(),
-        runs: toc.runs,
-        schemas: toc.schemas,
+        runs,
+        schemas: schemas
+            .into_iter()
+            .map(|schema| InspectSchema {
+                r: schema.run,
+                i: schema.table_index,
+                s: schema.schema_name,
+                n: schema.name,
+            })
+            .collect(),
         available_views,
         recommended_next,
     };
@@ -282,12 +311,51 @@ pub fn summary(
             250_000,
         )?;
         cpu_findings_from_rows(&trace, rows, limit, budget / limit.max(1).max(2))
-    } else {
-        let rows = cache::load_top_rows(
+    } else if preset == Preset::ThreadState {
+        let rows = cache::load_rows_for_preset(
             &conn,
             preset,
             resolved_run.as_deref(),
             target.as_deref(),
+            thread.as_deref(),
+            hide_system,
+            250_000,
+        )?;
+        thread_state_findings_from_rows(
+            &trace,
+            rows,
+            target.as_deref(),
+            limit,
+            budget / limit.max(1).max(2),
+        )
+    } else if preset == Preset::CpuCounters {
+        let mut rows = cache::load_rows_for_preset(
+            &conn,
+            preset,
+            resolved_run.as_deref(),
+            target.as_deref(),
+            thread.as_deref(),
+            hide_system,
+            500_000,
+        )?;
+        rows.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then(a.row_index.cmp(&b.row_index))
+        });
+        rows.truncate(limit);
+        findings_from_rows(preset, &trace, rows, budget / limit.max(1).max(2))
+    } else {
+        let target_filter = if preset == Preset::Memory {
+            None
+        } else {
+            target.as_deref()
+        };
+        let rows = cache::load_top_rows(
+            &conn,
+            preset,
+            resolved_run.as_deref(),
+            target_filter,
             thread.as_deref(),
             hide_system,
             limit,
@@ -300,7 +368,11 @@ pub fn summary(
         trace: trace.display().to_string(),
         preset: preset.as_str().to_string(),
         run: resolved_run,
-        cache_db: cache_info.db_path,
+        cache_db: if format == OutputFormat::Json {
+            Some(cache_info.db_path)
+        } else {
+            None
+        },
         target,
         thread,
         coverage: Coverage {
@@ -308,11 +380,11 @@ pub fn summary(
             shown_findings: findings.len(),
             budget_chars: budget,
             hidden_system_frames: if hide_system { "folded" } else { "shown" },
-            note: "v0.1 uses schema-aware table selection plus generic XML row scoring; raw evidence remains available through evidence IDs".to_string(),
+            note: "schema-aware compact summary; use evidence IDs for drill/raw".to_string(),
         },
         next_commands: findings
             .iter()
-            .take(3)
+            .take(1)
             .map(|f| {
                 format!(
                     "aitrace drill {} {} --budget 1000",
@@ -906,6 +978,16 @@ fn matching_schemas(schemas: &[SchemaRef], preset: Preset) -> Vec<&SchemaRef> {
             .collect();
     }
 
+    if preset == Preset::Memory {
+        let primary = schemas
+            .iter()
+            .filter(|schema| is_memory_schema(&schema.schema_name))
+            .collect::<Vec<_>>();
+        if !primary.is_empty() {
+            return primary;
+        }
+    }
+
     schemas
         .iter()
         .filter(|schema| {
@@ -918,14 +1000,41 @@ fn matching_schemas(schemas: &[SchemaRef], preset: Preset) -> Vec<&SchemaRef> {
         .collect()
 }
 
+fn is_memory_schema(schema_name: &str) -> bool {
+    let name = schema_name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "allocations.statistics"
+            | "vm-tracker.regions-map"
+            | "virtual-memory"
+            | "vm-tracker"
+            | "vmtrack"
+    ) || (name.contains("allocation") && name.contains("statistics"))
+        || name.contains("vm-tracker")
+        || name.contains("virtual-memory")
+}
+
 fn available_views(schemas: &[SchemaRef]) -> Vec<String> {
-    let mut views = BTreeSet::new();
+    let mut views = Vec::new();
     for preset in Preset::all_index_presets() {
         if !matching_schemas(schemas, *preset).is_empty() {
-            views.insert(preset.as_str().to_string());
+            views.push(preset.as_str().to_string());
         }
     }
-    views.into_iter().collect()
+    views
+}
+
+fn prioritize_views_for_trace(mut views: Vec<String>, schemas: &[SchemaRef]) -> Vec<String> {
+    if schemas
+        .iter()
+        .any(|schema| schema.schema_name == "allocations.statistics")
+    {
+        if let Some(pos) = views.iter().position(|view| view == "memory") {
+            let memory = views.remove(pos);
+            views.insert(0, memory);
+        }
+    }
+    views
 }
 
 fn parse_rows(xml: &[u8], limit: usize) -> Result<Vec<ParsedRow>> {
@@ -954,6 +1063,18 @@ fn parse_rows(xml: &[u8], limit: usize) -> Result<Vec<ParsedRow>> {
                 element_stack.push("row".to_string());
                 append_start(&mut current_raw, &e, false);
                 append_attrs_text(&mut current_text, &e, &mut refs);
+            }
+            Event::Empty(e) if e.name().as_ref() == b"row" && !in_row => {
+                row_index += 1;
+                current_text.clear();
+                append_attrs_text(&mut current_text, &e, &mut refs);
+                rows.push(ParsedRow {
+                    row_index,
+                    flat_text: output::one_line(&current_text.join(" ")),
+                });
+                if rows.len() >= limit {
+                    break;
+                }
             }
             Event::Start(e) if in_row => {
                 row_depth += 1;
@@ -1100,7 +1221,7 @@ fn indexed_row_from_parsed(
 ) -> IndexedRow {
     let percent_hint = max_percent(&flat_text);
     let time_ms_hint = max_time_ms(&flat_text);
-    let score = score_row(percent_hint, time_ms_hint, row_index);
+    let score = score_row_for_preset(preset, &flat_text, percent_hint, time_ms_hint, row_index);
     IndexedRow {
         evidence_id,
         preset: preset.as_str().to_string(),
@@ -1108,18 +1229,10 @@ fn indexed_row_from_parsed(
         table_index: schema.table_index,
         schema_name: schema.schema_name.clone(),
         row_index,
-        symbol_hint: if preset == Preset::Energy {
-            process_hint(&flat_text).or_else(|| symbol_hint(&flat_text))
-        } else {
-            symbol_hint(&flat_text).map(|symbol| normalize_swift_symbol(&symbol))
-        },
-        module_hint: if preset == Preset::Energy {
-            pid_hint(&flat_text).or_else(|| module_hint(&flat_text))
-        } else {
-            module_hint(&flat_text)
-        },
+        symbol_hint: symbol_hint_for_preset(preset, &flat_text),
+        module_hint: module_hint_for_preset(preset, &flat_text),
         thread_hint: thread_hint(&flat_text),
-        score,
+        score: score_for_output(preset, score),
         percent_hint,
         time_ms_hint,
         flat_text,
@@ -1190,12 +1303,113 @@ fn cpu_findings_from_rows(
                     row.sample_count,
                     row.first_excerpt
                 ),
-                excerpt_budget.max(140),
+                excerpt_budget.max(96),
             ),
             next: format!(
                 "aitrace drill {} {} --depth 8 --budget 1000",
                 shell_quote(trace),
                 row.first_evidence
+            ),
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct ThreadStateAgg {
+    state: String,
+    thread: Option<String>,
+    total_ms: f64,
+    max_ms: f64,
+    samples: usize,
+    first_evidence: String,
+    first_schema: String,
+    first_excerpt: String,
+}
+
+fn thread_state_findings_from_rows(
+    trace: &Path,
+    rows: Vec<IndexedRow>,
+    target: Option<&str>,
+    limit: usize,
+    excerpt_budget: usize,
+) -> Vec<Finding> {
+    let mut aggs = HashMap::<String, ThreadStateAgg>::new();
+    for row in rows {
+        if target
+            .map(|target| !row_matches_target_process(&row.flat_text, target))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let state = thread_state_hint(&row.flat_text).unwrap_or_else(|| row.schema_name.clone());
+        if is_low_signal_thread_state(&state) {
+            continue;
+        }
+        let duration = row.time_ms_hint.unwrap_or(1.0);
+        let key = format!("{}|{}", state, row.thread_hint.as_deref().unwrap_or(""));
+        let entry = aggs.entry(key).or_insert_with(|| ThreadStateAgg {
+            state,
+            thread: row.thread_hint.clone(),
+            total_ms: 0.0,
+            max_ms: 0.0,
+            samples: 0,
+            first_evidence: row.evidence_id.clone(),
+            first_schema: row.schema_name.clone(),
+            first_excerpt: row.flat_text.clone(),
+        });
+        entry.total_ms += duration;
+        entry.max_ms = entry.max_ms.max(duration);
+        entry.samples += 1;
+    }
+
+    let mut aggs = aggs.into_values().collect::<Vec<_>>();
+    aggs.sort_by(|a, b| {
+        thread_state_sort_score(b)
+            .total_cmp(&thread_state_sort_score(a))
+            .then(b.max_ms.total_cmp(&a.max_ms))
+            .then(b.samples.cmp(&a.samples))
+    });
+
+    aggs.into_iter()
+        .take(limit)
+        .enumerate()
+        .map(|(idx, agg)| Finding {
+            id: format!("thread-state.hotspot.{}", idx + 1),
+            severity: if agg.max_ms >= 1000.0 || agg.total_ms >= 5000.0 {
+                "high"
+            } else if agg.max_ms >= 100.0 || agg.total_ms >= 1000.0 {
+                "medium"
+            } else {
+                "low"
+            },
+            title: format!(
+                "{} {}",
+                short_thread(agg.thread.as_deref(), &agg.first_excerpt),
+                agg.state
+            ),
+            symbol: Some(agg.state.clone()),
+            module: None,
+            thread: agg.thread.clone(),
+            score: round1(agg.total_ms),
+            percent_hint: None,
+            time_ms_hint: Some(round1(agg.max_ms)),
+            schema: agg.first_schema,
+            evidence: agg.first_evidence.clone(),
+            excerpt: output::truncate_chars(
+                &format!(
+                    "state={} total={} max={} samples={} rep={}",
+                    agg.state,
+                    format_ms(agg.total_ms),
+                    format_ms(agg.max_ms),
+                    agg.samples,
+                    thread_state_excerpt(&agg.first_excerpt)
+                ),
+                excerpt_budget.max(96),
+            ),
+            next: format!(
+                "aitrace drill {} {} --depth 8 --budget 1000",
+                shell_quote(trace),
+                agg.first_evidence
             ),
         })
         .collect()
@@ -1856,24 +2070,17 @@ fn finding_from_row(
     } else {
         (row.score, "score")
     };
-    let excerpt = if preset == Preset::Cpu {
-        format!("cpu={} {}", format_cpu_weight(score, unit), row.flat_text)
-    } else {
-        row.flat_text.clone()
+    let excerpt = match preset {
+        Preset::Cpu => format!("cpu={} {}", format_cpu_weight(score, unit), row.flat_text),
+        Preset::Memory => memory_excerpt(&row.flat_text),
+        Preset::CpuCounters => counter_excerpt(&row.flat_text),
+        Preset::Poi => poi_excerpt(&row.flat_text),
+        Preset::ThreadState => thread_state_excerpt(&row.flat_text),
+        _ => row.flat_text.clone(),
     };
     Finding {
         id: format!("{}.hotspot.{}", preset.as_str(), index),
-        severity: if preset == Preset::Cpu {
-            if score >= high_cpu_threshold(unit) {
-                "high"
-            } else if score >= medium_cpu_threshold(unit) {
-                "medium"
-            } else {
-                "low"
-            }
-        } else {
-            severity(row)
-        },
+        severity: severity_for_preset(preset, row, score, unit),
         title,
         symbol: row.symbol_hint.clone(),
         module: row.module_hint.clone(),
@@ -1883,7 +2090,7 @@ fn finding_from_row(
         time_ms_hint: row.time_ms_hint,
         schema: row.schema_name.clone(),
         evidence: row.evidence_id.clone(),
-        excerpt: output::truncate_chars(&excerpt, excerpt_budget.max(160)),
+        excerpt: output::truncate_chars(&excerpt, excerpt_budget.max(96)),
         next: format!(
             "aitrace drill {} {} --depth 8 --budget 1000",
             shell_quote(trace),
@@ -1899,6 +2106,53 @@ fn severity(row: &IndexedRow) -> &'static str {
         "medium"
     } else {
         "low"
+    }
+}
+
+fn severity_for_preset(preset: Preset, row: &IndexedRow, score: f64, unit: &str) -> &'static str {
+    match preset {
+        Preset::Cpu => {
+            if score >= high_cpu_threshold(unit) {
+                "high"
+            } else if score >= medium_cpu_threshold(unit) {
+                "medium"
+            } else {
+                "low"
+            }
+        }
+        Preset::Memory => {
+            let live = numeric_attr(
+                &row.flat_text,
+                &["persistent-bytes", "resident-size", "dirty-size", "size"],
+            )
+            .unwrap_or(0.0);
+            if live >= 512.0 * 1024.0 * 1024.0 {
+                "high"
+            } else if live >= 64.0 * 1024.0 * 1024.0 {
+                "medium"
+            } else {
+                "low"
+            }
+        }
+        Preset::ThreadState => {
+            if row.time_ms_hint.unwrap_or(0.0) >= 1000.0 {
+                "high"
+            } else if row.time_ms_hint.unwrap_or(0.0) >= 100.0 {
+                "medium"
+            } else {
+                "low"
+            }
+        }
+        Preset::CpuCounters => {
+            if score >= 100.0 {
+                "high"
+            } else if score >= 10.0 {
+                "medium"
+            } else {
+                "low"
+            }
+        }
+        _ => severity(row),
     }
 }
 
@@ -2050,6 +2304,364 @@ fn score_row(percent: Option<f64>, time_ms: Option<f64>, row_index: usize) -> f6
     let time_score = time_ms.unwrap_or(0.0);
     let stable_tiebreak = 1.0 / (row_index.max(1) as f64);
     percent_score + time_score + stable_tiebreak
+}
+
+fn score_row_for_preset(
+    preset: Preset,
+    text: &str,
+    percent: Option<f64>,
+    time_ms: Option<f64>,
+    row_index: usize,
+) -> f64 {
+    let base = score_row(percent, time_ms, row_index);
+    match preset {
+        Preset::Memory => memory_score(text).unwrap_or(base),
+        Preset::CpuCounters => counter_score(text).unwrap_or(base),
+        Preset::ThreadState => time_ms.unwrap_or(base),
+        Preset::Poi => time_ms.unwrap_or(base),
+        _ => base,
+    }
+}
+
+fn symbol_hint_for_preset(preset: Preset, text: &str) -> Option<String> {
+    match preset {
+        Preset::Energy => process_hint(text).or_else(|| symbol_hint(text)),
+        Preset::Memory => memory_title_hint(text).or_else(|| symbol_hint(text)),
+        Preset::CpuCounters => counter_title_hint(text).or_else(|| symbol_hint(text)),
+        Preset::Poi => poi_title_hint(text).or_else(|| symbol_hint(text)),
+        Preset::ThreadState => thread_state_title_hint(text).or_else(|| symbol_hint(text)),
+        _ => symbol_hint(text).map(|symbol| normalize_swift_symbol(&symbol)),
+    }
+}
+
+fn module_hint_for_preset(preset: Preset, text: &str) -> Option<String> {
+    match preset {
+        Preset::Energy => pid_hint(text).or_else(|| module_hint(text)),
+        Preset::Memory => byte_total_label(text).or_else(|| module_hint(text)),
+        Preset::CpuCounters => attr_value(text, "process").or_else(|| module_hint(text)),
+        _ => module_hint(text),
+    }
+}
+
+fn attr_value(text: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=");
+    let pos = text.find(&needle)?;
+    let after = &text[pos + needle.len()..];
+    let end = next_attr_offset(after).unwrap_or(after.len());
+    let value = clean_token(&html_unescape(&after[..end]));
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn numeric_attr(text: &str, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|key| {
+        attr_value(text, key).and_then(|value| {
+            value
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '.')
+                .collect::<String>()
+                .parse::<f64>()
+                .ok()
+        })
+    })
+}
+
+fn memory_score(text: &str) -> Option<f64> {
+    let live = numeric_attr(
+        text,
+        &["persistent-bytes", "resident-size", "dirty-size", "size"],
+    )?;
+    let total = numeric_attr(text, &["total-bytes", "virtual-size"]).unwrap_or(0.0);
+    let transient = numeric_attr(text, &["transient-bytes"]).unwrap_or(0.0);
+    Some((live * 10.0 + total * 0.01 + transient * 0.001) / (1024.0 * 1024.0))
+}
+
+fn counter_score(text: &str) -> Option<f64> {
+    let values = counter_values(text);
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.iter().sum::<f64>() / 1_000_000.0)
+    }
+}
+
+fn counter_values(text: &str) -> Vec<f64> {
+    attr_value(text, "uint64-array")
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|value| {
+            let trimmed = value.trim_matches(|c: char| c == ',' || c == '[' || c == ']');
+            if let Some(hex) = trimmed.strip_prefix("0x") {
+                u64::from_str_radix(hex, 16).ok().map(|v| v as f64)
+            } else {
+                trimmed.parse::<f64>().ok()
+            }
+        })
+        .collect()
+}
+
+fn memory_title_hint(text: &str) -> Option<String> {
+    attr_value(text, "category")
+        .or_else(|| attr_value(text, "responsible-caller"))
+        .map(|value| output::truncate_chars(&value, 96))
+}
+
+fn counter_title_hint(text: &str) -> Option<String> {
+    attr_value(text, "thread")
+        .or_else(|| attr_value(text, "process"))
+        .map(|value| output::truncate_chars(&value, 96))
+}
+
+fn poi_title_hint(text: &str) -> Option<String> {
+    attr_value(text, "name")
+        .or_else(|| attr_value(text, "category"))
+        .or_else(|| attr_value(text, "event-concept"))
+        .or_else(|| attr_value(text, "subsystem"))
+        .map(|value| output::truncate_chars(&value, 96))
+}
+
+fn thread_state_title_hint(text: &str) -> Option<String> {
+    let state = thread_state_hint(text)?;
+    let thread = thread_hint(text);
+    Some(match thread {
+        Some(thread) => format!("{} {}", output::truncate_chars(&thread, 48), state),
+        None => state,
+    })
+}
+
+fn byte_total_label(text: &str) -> Option<String> {
+    numeric_attr(
+        text,
+        &["persistent-bytes", "resident-size", "dirty-size", "size"],
+    )
+    .map(|bytes| format!("live {}", format_bytes(bytes)))
+}
+
+fn memory_excerpt(text: &str) -> String {
+    let mut parts = Vec::new();
+    if let Some(category) = attr_value(text, "category") {
+        parts.push(format!("cat={}", output::truncate_chars(&category, 64)));
+    }
+    if let Some(bytes) = numeric_attr(text, &["persistent-bytes", "resident-size", "dirty-size"]) {
+        parts.push(format!("live={}", format_bytes(bytes)));
+    }
+    if let Some(bytes) = numeric_attr(text, &["total-bytes", "virtual-size"]) {
+        parts.push(format!("total={}", format_bytes(bytes)));
+    }
+    if let Some(bytes) = numeric_attr(text, &["transient-bytes"]) {
+        parts.push(format!("trans={}", format_bytes(bytes)));
+    }
+    if let Some(count) = numeric_attr(text, &["count-persistent", "count-total", "count-events"]) {
+        parts.push(format!("count={}", format_count(count)));
+    }
+    if let Some(caller) = attr_value(text, "responsible-caller") {
+        parts.push(format!("caller={}", output::truncate_chars(&caller, 72)));
+    }
+    if parts.is_empty() {
+        output::truncate_chars(text, 160)
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn counter_excerpt(text: &str) -> String {
+    let mut parts = Vec::new();
+    if let Some(time) = attr_value(text, "start-time").or_else(|| attr_value(text, "timestamp")) {
+        parts.push(format!("t={time}"));
+    }
+    if let Some(duration) = attr_value(text, "duration") {
+        parts.push(format!("dur={duration}"));
+    }
+    if let Some(process) = attr_value(text, "process") {
+        parts.push(format!("proc={}", output::truncate_chars(&process, 48)));
+    }
+    if let Some(thread) = attr_value(text, "thread") {
+        parts.push(format!("th={}", output::truncate_chars(&thread, 48)));
+    }
+    let values = counter_values(text)
+        .into_iter()
+        .take(6)
+        .map(format_count)
+        .collect::<Vec<_>>();
+    if !values.is_empty() {
+        parts.push(format!("values=[{}]", values.join(",")));
+    }
+    if parts.is_empty() {
+        output::truncate_chars(text, 160)
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn poi_excerpt(text: &str) -> String {
+    let mut parts = Vec::new();
+    for key in [
+        "start-time",
+        "time",
+        "timestamp",
+        "duration",
+        "subsystem",
+        "category",
+        "name",
+    ] {
+        if let Some(value) = attr_value(text, key) {
+            parts.push(format!("{key}={}", output::truncate_chars(&value, 56)));
+        }
+    }
+    if parts.is_empty() {
+        output::truncate_chars(text, 160)
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn thread_state_excerpt(text: &str) -> String {
+    let mut parts = Vec::new();
+    if let Some(start) = attr_value(text, "start-time").or_else(|| attr_value(text, "event-time")) {
+        parts.push(format!("t={start}"));
+    }
+    if let Some(thread) = attr_value(text, "thread") {
+        parts.push(format!("th={}", output::truncate_chars(&thread, 56)));
+    }
+    if let Some(state) = thread_state_hint(text) {
+        parts.push(format!("state={state}"));
+    }
+    if let Some(duration) = attr_value(text, "duration") {
+        parts.push(format!("dur={duration}"));
+    }
+    if let Some(narrative) = attr_value(text, "narrative") {
+        parts.push(format!("why={}", output::truncate_chars(&narrative, 72)));
+    }
+    if parts.is_empty() {
+        output::truncate_chars(text, 160)
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn thread_state_hint(text: &str) -> Option<String> {
+    if let Some(state) = attr_value(text, "thread-state").or_else(|| attr_value(text, "state")) {
+        return Some(normalize_thread_state_value(&state));
+    }
+    let narrative = attr_value(text, "narrative")?;
+    let lower = narrative.to_ascii_lowercase();
+    if lower.contains("blocked") {
+        Some("Blocked".to_string())
+    } else if lower.contains("ran") || lower.contains("running") {
+        Some("Running".to_string())
+    } else if lower.contains("waiting") || lower.starts_with("called ") {
+        Some("Waiting".to_string())
+    } else if lower.contains("idle") {
+        Some("Idle".to_string())
+    } else {
+        Some(output::truncate_chars(&narrative, 48))
+    }
+}
+
+fn is_low_signal_thread_state(state: &str) -> bool {
+    let lower = state.to_ascii_lowercase();
+    lower == "idle" || lower == "context-switch" || lower == "thread-snapshot"
+}
+
+fn normalize_thread_state_value(state: &str) -> String {
+    let lower = state.to_ascii_lowercase();
+    if lower.contains("blocked") {
+        "Blocked".to_string()
+    } else if lower.contains("running") || lower == "run" || lower == "ran" {
+        "Running".to_string()
+    } else if lower.contains("waiting")
+        || lower.starts_with("will wait")
+        || lower.starts_with("called ")
+    {
+        "Waiting".to_string()
+    } else if lower.contains("idle") {
+        "Idle".to_string()
+    } else {
+        output::truncate_chars(state, 48)
+    }
+}
+
+fn thread_state_sort_score(agg: &ThreadStateAgg) -> f64 {
+    let lower = agg.state.to_ascii_lowercase();
+    let weight = if lower == "blocked" {
+        8.0
+    } else if lower == "running" {
+        1.0
+    } else if lower == "waiting" {
+        0.08
+    } else {
+        0.5
+    };
+    agg.total_ms * weight + agg.max_ms
+}
+
+fn row_matches_target_process(text: &str, target: &str) -> bool {
+    let text_lc = text.to_ascii_lowercase();
+    let target_lc = target.to_ascii_lowercase();
+    let process_patterns = [
+        format!("process={target_lc} ("),
+        format!("({target_lc}, pid:"),
+        format!("thread={target_lc} ("),
+    ];
+    if process_patterns
+        .iter()
+        .any(|pattern| text_lc.contains(pattern))
+    {
+        return true;
+    }
+    if text_lc.contains("process=") || text_lc.contains(", pid:") {
+        return false;
+    }
+    text_lc.contains(&target_lc)
+}
+
+fn format_bytes(bytes: f64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    if bytes >= GIB {
+        format!("{:.1}GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1}MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1}KiB", bytes / KIB)
+    } else {
+        format!("{bytes:.0}B")
+    }
+}
+
+fn format_count(value: f64) -> String {
+    if value >= 1_000_000_000.0 {
+        format!("{:.1}B", value / 1_000_000_000.0)
+    } else if value >= 1_000_000.0 {
+        format!("{:.1}M", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("{:.1}K", value / 1_000.0)
+    } else {
+        format!("{value:.0}")
+    }
+}
+
+fn format_ms(ms: f64) -> String {
+    if ms >= 1000.0 {
+        format!("{:.2}s", ms / 1000.0)
+    } else {
+        format!("{ms:.0}ms")
+    }
+}
+
+fn round1(value: f64) -> f64 {
+    (value * 10.0).round() / 10.0
+}
+
+fn score_for_output(preset: Preset, score: f64) -> f64 {
+    match preset {
+        Preset::CpuCounters | Preset::Memory | Preset::Poi | Preset::ThreadState => round1(score),
+        _ => score,
+    }
 }
 
 fn symbol_hint(text: &str) -> Option<String> {
@@ -2548,6 +3160,18 @@ mod tests {
         let xml = br#"<trace-query-result><node><schema name="os-signpost"><col><name>Name</name></col></schema></node></trace-query-result>"#;
         let rows = parse_rows(xml, 10).unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn parses_empty_rows_from_track_details() {
+        let xml = br#"<trace-query-result><node><row category="All Heap" persistent-bytes="1024" total-bytes="4096"/></node></trace-query-result>"#;
+        let rows = parse_rows(xml, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].flat_text.contains("category=All Heap"));
+        assert_eq!(
+            memory_score(&rows[0].flat_text),
+            Some(10280.96 / (1024.0 * 1024.0))
+        );
     }
 
     #[test]

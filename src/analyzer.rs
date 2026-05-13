@@ -4,7 +4,7 @@ use crate::output;
 use crate::toc::{self, SchemaRef};
 use crate::xctrace;
 use anyhow::{bail, Context, Result};
-use quick_xml::events::{BytesEnd, BytesStart, Event};
+use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use regex::Regex;
 use rusqlite::Connection;
@@ -14,6 +14,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::thread;
 
 const RAW_TABLE_STORE_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -172,11 +173,20 @@ struct RowExcerpt {
     excerpt: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ParsedRow {
     row_index: usize,
     flat_text: String,
 }
+
+#[derive(Debug, Clone)]
+struct IndexTask {
+    preset: Preset,
+    schema: SchemaRef,
+}
+
+type ExportedRows = (Vec<u8>, Vec<ParsedRow>);
+type SchemaExportResult = (SchemaRef, Result<ExportedRows>);
 
 pub fn inspect(trace: PathBuf, format: OutputFormat, limit: usize) -> Result<()> {
     validate_trace(&trace)?;
@@ -198,7 +208,7 @@ pub fn inspect(trace: PathBuf, format: OutputFormat, limit: usize) -> Result<()>
                 1200
             };
             format!(
-                "aitrace summary {} --preset {} --budget {}",
+                "aitrace summary {} --preset {} --run latest --budget {}",
                 shell_quote(&trace),
                 view,
                 budget
@@ -346,7 +356,7 @@ pub fn summary(
         rows.truncate(limit);
         findings_from_rows(preset, &trace, rows, budget / limit.max(1).max(2))
     } else {
-        let target_filter = if preset == Preset::Memory {
+        let target_filter = if preset == Preset::Memory || preset == Preset::Health {
             None
         } else {
             target.as_deref()
@@ -769,6 +779,8 @@ fn build_index(
     let selected = selected_presets(preset);
     let mut warnings = Vec::new();
     let mut exported_tables = Vec::new();
+    let mut tasks = Vec::new();
+    let mut unique_schemas = BTreeMap::<String, SchemaRef>::new();
 
     for selected_preset in selected.iter().copied() {
         let matched = matching_schemas(&toc.schemas, selected_preset);
@@ -790,64 +802,88 @@ fn build_index(
         }
 
         for schema in matched {
-            let table_evidence = table_evidence_id(selected_preset, schema);
-            match xctrace::export_xpath(trace, &schema.suggested_xpath) {
-                Ok(xml) => {
-                    let rows = parse_rows(&xml, limit_rows_per_table)?;
-                    let mut rows_indexed = 0usize;
-                    with_transaction(conn, |conn| {
-                        if xml.len() <= RAW_TABLE_STORE_LIMIT_BYTES {
-                            cache::insert_raw_fragment(
-                                conn,
-                                &table_evidence,
-                                "table",
-                                Some(selected_preset),
-                                schema,
-                                None,
-                                &xml,
-                            )?;
-                        } else {
-                            warnings.push(format!(
-                                "raw table omitted for {} run {} table {} ({} bytes > {} bytes); indexed row evidence remains available",
-                                schema.schema_name,
-                                schema.run,
-                                schema.table_index,
-                                xml.len(),
-                                RAW_TABLE_STORE_LIMIT_BYTES
-                            ));
-                        }
-
-                        for row in rows {
-                            let evidence_id =
-                                row_evidence_id(selected_preset, schema, row.row_index);
-                            let indexed = indexed_row_from_parsed(
-                                selected_preset,
-                                schema,
-                                row.row_index,
-                                evidence_id,
-                                row.flat_text,
-                            );
-                            cache::insert_row(conn, &indexed)?;
-                            rows_indexed += 1;
-                        }
-                        Ok(())
-                    })?;
-                    exported_tables.push(ExportedTable {
-                        preset: selected_preset.as_str().to_string(),
-                        run: schema.run.clone(),
-                        table_index: schema.table_index,
-                        schema_name: schema.schema_name.clone(),
-                        evidence: table_evidence,
-                        rows_indexed,
-                        bytes: xml.len(),
-                    });
-                }
-                Err(err) => warnings.push(format!(
-                    "failed to export {} table {} ({}): {}",
-                    schema.run, schema.table_index, schema.schema_name, err
-                )),
-            }
+            unique_schemas
+                .entry(schema.suggested_xpath.clone())
+                .or_insert_with(|| schema.clone());
+            tasks.push(IndexTask {
+                preset: selected_preset,
+                schema: schema.clone(),
+            });
         }
+    }
+
+    let exported = export_schemas_parallel(
+        trace,
+        unique_schemas.into_values().collect(),
+        limit_rows_per_table,
+    );
+    let mut export_cache = HashMap::<String, (Vec<u8>, Vec<ParsedRow>)>::new();
+    for (schema, result) in exported {
+        match result {
+            Ok((xml, rows)) => {
+                export_cache.insert(schema.suggested_xpath, (xml, rows));
+            }
+            Err(err) => warnings.push(format!(
+                "failed to export {} table {} ({}): {}",
+                schema.run, schema.table_index, schema.schema_name, err
+            )),
+        }
+    }
+
+    for task in tasks {
+        let Some((xml, rows)) = export_cache.get(&task.schema.suggested_xpath) else {
+            continue;
+        };
+        let table_evidence = table_evidence_id(task.preset, &task.schema);
+        let mut rows_indexed = 0usize;
+        with_transaction(conn, |conn| {
+            if xml.len() <= RAW_TABLE_STORE_LIMIT_BYTES {
+                cache::insert_raw_fragment(
+                    conn,
+                    &table_evidence,
+                    "table",
+                    Some(task.preset),
+                    &task.schema,
+                    None,
+                    xml,
+                )?;
+            } else {
+                warnings.push(format!(
+                    "raw table omitted for {} run {} table {} ({} bytes > {} bytes); indexed row evidence remains available",
+                    task.schema.schema_name,
+                    task.schema.run,
+                    task.schema.table_index,
+                    xml.len(),
+                    RAW_TABLE_STORE_LIMIT_BYTES
+                ));
+            }
+
+            let indexed_rows = rows
+                .iter()
+                .map(|row| {
+                    let evidence_id = row_evidence_id(task.preset, &task.schema, row.row_index);
+                    indexed_row_from_parsed(
+                        task.preset,
+                        &task.schema,
+                        row.row_index,
+                        evidence_id,
+                        row.flat_text.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows_indexed = indexed_rows.len();
+            cache::insert_rows(conn, &indexed_rows)?;
+            Ok(())
+        })?;
+        exported_tables.push(ExportedTable {
+            preset: task.preset.as_str().to_string(),
+            run: task.schema.run.clone(),
+            table_index: task.schema.table_index,
+            schema_name: task.schema.schema_name.clone(),
+            evidence: table_evidence,
+            rows_indexed,
+            bytes: xml.len(),
+        });
     }
 
     with_transaction(conn, |conn| cache::set_meta(conn, "complete", "true"))?;
@@ -862,6 +898,67 @@ fn build_index(
         warnings,
         next_commands: default_next_commands(trace),
     })
+}
+
+fn export_schemas_parallel(
+    trace: &Path,
+    schemas: Vec<SchemaRef>,
+    limit_rows_per_table: usize,
+) -> Vec<SchemaExportResult> {
+    let jobs = export_jobs().max(1);
+    let mut out = Vec::with_capacity(schemas.len());
+    let mut pending = schemas.into_iter();
+
+    loop {
+        let chunk = pending.by_ref().take(jobs).collect::<Vec<_>>();
+        if chunk.is_empty() {
+            break;
+        }
+        let handles = chunk
+            .into_iter()
+            .map(|schema| {
+                let trace = trace.to_path_buf();
+                thread::spawn(move || {
+                    let result =
+                        xctrace::export_xpath(&trace, &schema.suggested_xpath).and_then(|xml| {
+                            let rows = parse_rows(&xml, limit_rows_per_table)?;
+                            Ok((xml, rows))
+                        });
+                    (schema, result)
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            match handle.join() {
+                Ok(result) => out.push(result),
+                Err(_) => out.push((
+                    SchemaRef {
+                        run: "?".to_string(),
+                        table_index: 0,
+                        schema_name: "unknown".to_string(),
+                        name: None,
+                        documentation: None,
+                        suggested_xpath: String::new(),
+                    },
+                    Err(anyhow::anyhow!("xctrace export worker panicked")),
+                )),
+            }
+        }
+    }
+
+    out
+}
+
+fn export_jobs() -> usize {
+    std::env::var("AITRACE_JOBS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|jobs| *jobs > 0)
+        .unwrap_or_else(|| {
+            thread::available_parallelism()
+                .map(|n| n.get().clamp(1, 3))
+                .unwrap_or(2)
+        })
 }
 
 fn with_transaction<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -960,6 +1057,26 @@ fn selected_presets(preset: Option<Preset>) -> Vec<Preset> {
 }
 
 fn matching_schemas(schemas: &[SchemaRef], preset: Preset) -> Vec<&SchemaRef> {
+    if preset == Preset::Animation {
+        let primary = schemas
+            .iter()
+            .filter(|schema| is_primary_animation_schema(&schema.schema_name))
+            .collect::<Vec<_>>();
+        if !primary.is_empty() {
+            return primary;
+        }
+        let fallback = schemas
+            .iter()
+            .filter(|schema| {
+                is_animation_schema(&schema.schema_name, schema.name.as_deref())
+                    && !is_low_value_animation_schema(&schema.schema_name)
+            })
+            .collect::<Vec<_>>();
+        if !fallback.is_empty() {
+            return fallback;
+        }
+    }
+
     if preset == Preset::Cpu {
         let primary = schemas
             .iter()
@@ -988,6 +1105,43 @@ fn matching_schemas(schemas: &[SchemaRef], preset: Preset) -> Vec<&SchemaRef> {
         }
     }
 
+    if preset == Preset::Health {
+        let primary = schemas
+            .iter()
+            .filter(|schema| is_primary_health_schema(&schema.schema_name))
+            .collect::<Vec<_>>();
+        if !primary.is_empty() {
+            return primary;
+        }
+        let fallback = schemas
+            .iter()
+            .filter(|schema| is_health_schema(&schema.schema_name, schema.name.as_deref()))
+            .collect::<Vec<_>>();
+        if !fallback.is_empty() {
+            return fallback;
+        }
+    }
+
+    if preset == Preset::Ui {
+        let primary = schemas
+            .iter()
+            .filter(|schema| is_primary_ui_schema(&schema.schema_name))
+            .collect::<Vec<_>>();
+        if !primary.is_empty() {
+            return primary;
+        }
+        let fallback = schemas
+            .iter()
+            .filter(|schema| {
+                is_ui_schema(&schema.schema_name, schema.name.as_deref())
+                    && !is_low_value_animation_schema(&schema.schema_name)
+            })
+            .collect::<Vec<_>>();
+        if !fallback.is_empty() {
+            return fallback;
+        }
+    }
+
     schemas
         .iter()
         .filter(|schema| {
@@ -998,6 +1152,142 @@ fn matching_schemas(schemas: &[SchemaRef], preset: Preset) -> Vec<&SchemaRef> {
             )
         })
         .collect()
+}
+
+fn is_animation_schema(schema_name: &str, name: Option<&str>) -> bool {
+    let haystack = format!(
+        "{} {}",
+        schema_name.to_ascii_lowercase(),
+        name.unwrap_or("").to_ascii_lowercase()
+    );
+    contains_any(
+        &haystack,
+        &[
+            "animation",
+            "core-animation",
+            "core animation",
+            "ca-",
+            "display-compositor",
+            "display-link",
+            "display-surface",
+            "display-vsync",
+            "displayed-surfaces",
+            "cadisplaylink",
+            "hitch",
+            "jank",
+            "frame",
+            "fps",
+            "compositor",
+            "visual-chain",
+            "visual-connection",
+            "render-server",
+            "render server",
+            "swiftui-update",
+            "swiftui-causes",
+        ],
+    )
+}
+
+fn is_primary_animation_schema(schema_name: &str) -> bool {
+    let name = schema_name.to_ascii_lowercase();
+    matches!(name.as_str(), "hitches" | "hitches-updates")
+}
+
+fn is_primary_ui_schema(schema_name: &str) -> bool {
+    let name = schema_name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "hitches" | "hitches-updates" | "swiftui-update" | "swiftui-causes"
+    )
+}
+
+fn is_low_value_animation_schema(schema_name: &str) -> bool {
+    let name = schema_name.to_ascii_lowercase();
+    !is_primary_animation_schema(&name)
+        && (name.starts_with("hitches-")
+            || contains_any(
+                &name,
+                &[
+                    "device-gpu-info",
+                    "device-display-info",
+                    "display-compositor-events-interval",
+                    "display-compositor-interval",
+                    "display-events-interval",
+                    "display-surface-queue",
+                    "display-surface-swap",
+                    "display-vsyncs-interval",
+                    "displayed-surfaces-interval",
+                    "metal-",
+                    "metal-gpu-info",
+                    "metal-command-buffer-completed",
+                    "metal-io-surface-access",
+                    "metal-object-dependency",
+                    "metal-visual-highlight",
+                    "known-compositor-process",
+                    "process-info",
+                    "thread-info",
+                    "time-info",
+                ],
+            ))
+}
+
+fn is_health_schema(schema_name: &str, name: Option<&str>) -> bool {
+    let haystack = format!(
+        "{} {}",
+        schema_name.to_ascii_lowercase(),
+        name.unwrap_or("").to_ascii_lowercase()
+    );
+    contains_any(
+        &haystack,
+        &[
+            "health",
+            "hang-risk",
+            "hang-risks",
+            "potential-hang",
+            "issue",
+            "diagnostic",
+            "fault",
+            "thermal",
+            "pressure",
+            "watchdog",
+        ],
+    )
+}
+
+fn is_primary_health_schema(schema_name: &str) -> bool {
+    let name = schema_name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "hang-risks" | "device-thermal-state" | "device-thermal-state-intervals"
+    )
+}
+
+fn is_ui_schema(schema_name: &str, name: Option<&str>) -> bool {
+    let haystack = format!(
+        "{} {}",
+        schema_name.to_ascii_lowercase(),
+        name.unwrap_or("").to_ascii_lowercase()
+    );
+    contains_any(
+        &haystack,
+        &[
+            "swiftui",
+            "ui.",
+            "uikit",
+            "appkit",
+            "layout",
+            "render",
+            "display-compositor",
+            "display-surface",
+            "runloop",
+            "run-loop",
+            "main-thread",
+            "hitch",
+            "hang",
+            "visual-chain",
+            "visual-connection",
+        ],
+    ) || (haystack.contains("view") && !haystack.contains("overview"))
 }
 
 fn is_memory_schema(schema_name: &str) -> bool {
@@ -1027,6 +1317,24 @@ fn available_views(schemas: &[SchemaRef]) -> Vec<String> {
 fn prioritize_views_for_trace(mut views: Vec<String>, schemas: &[SchemaRef]) -> Vec<String> {
     if schemas
         .iter()
+        .any(|schema| is_animation_schema(&schema.schema_name, schema.name.as_deref()))
+    {
+        if let Some(pos) = views.iter().position(|view| view == "animation") {
+            let animation = views.remove(pos);
+            views.insert(0, animation);
+        }
+    }
+    if schemas
+        .iter()
+        .any(|schema| is_ui_schema(&schema.schema_name, schema.name.as_deref()))
+    {
+        if let Some(pos) = views.iter().position(|view| view == "ui") {
+            let ui = views.remove(pos);
+            views.insert(0, ui);
+        }
+    }
+    if schemas
+        .iter()
         .any(|schema| schema.schema_name == "allocations.statistics")
     {
         if let Some(pos) = views.iter().position(|view| view == "memory") {
@@ -1045,7 +1353,6 @@ fn parse_rows(xml: &[u8], limit: usize) -> Result<Vec<ParsedRow>> {
 
     let mut in_row = false;
     let mut row_depth = 0usize;
-    let mut current_raw = Vec::<u8>::new();
     let mut current_text = Vec::<String>::new();
     let mut row_index = 0usize;
     let mut refs = HashMap::<String, String>::new();
@@ -1057,11 +1364,9 @@ fn parse_rows(xml: &[u8], limit: usize) -> Result<Vec<ParsedRow>> {
                 in_row = true;
                 row_depth = 1;
                 row_index += 1;
-                current_raw.clear();
                 current_text.clear();
                 element_stack.clear();
                 element_stack.push("row".to_string());
-                append_start(&mut current_raw, &e, false);
                 append_attrs_text(&mut current_text, &e, &mut refs);
             }
             Event::Empty(e) if e.name().as_ref() == b"row" && !in_row => {
@@ -1079,15 +1384,12 @@ fn parse_rows(xml: &[u8], limit: usize) -> Result<Vec<ParsedRow>> {
             Event::Start(e) if in_row => {
                 row_depth += 1;
                 element_stack.push(String::from_utf8_lossy(e.name().as_ref()).into_owned());
-                append_start(&mut current_raw, &e, false);
                 append_attrs_text(&mut current_text, &e, &mut refs);
             }
             Event::Empty(e) if in_row => {
-                append_start(&mut current_raw, &e, true);
                 append_attrs_text(&mut current_text, &e, &mut refs);
             }
             Event::Text(e) if in_row => {
-                current_raw.extend_from_slice(e.as_ref());
                 let text = String::from_utf8_lossy(e.as_ref()).trim().to_string();
                 if !text.is_empty() {
                     let element = element_stack.last().map(String::as_str).unwrap_or("");
@@ -1099,9 +1401,6 @@ fn parse_rows(xml: &[u8], limit: usize) -> Result<Vec<ParsedRow>> {
                 }
             }
             Event::CData(e) if in_row => {
-                current_raw.extend_from_slice(b"<![CDATA[");
-                current_raw.extend_from_slice(e.as_ref());
-                current_raw.extend_from_slice(b"]]>");
                 let text = String::from_utf8_lossy(e.as_ref()).trim().to_string();
                 if !text.is_empty() {
                     let element = element_stack.last().map(String::as_str).unwrap_or("");
@@ -1112,8 +1411,7 @@ fn parse_rows(xml: &[u8], limit: usize) -> Result<Vec<ParsedRow>> {
                     }
                 }
             }
-            Event::End(e) if in_row => {
-                append_end(&mut current_raw, &e);
+            Event::End(_) if in_row => {
                 element_stack.pop();
                 row_depth = row_depth.saturating_sub(1);
                 if row_depth == 0 {
@@ -1187,29 +1485,6 @@ fn append_attrs_text(
             }
         }
     }
-}
-
-fn append_start(out: &mut Vec<u8>, e: &BytesStart<'_>, empty: bool) {
-    out.push(b'<');
-    out.extend_from_slice(e.name().as_ref());
-    for attr in e.attributes().with_checks(false).flatten() {
-        out.push(b' ');
-        out.extend_from_slice(attr.key.as_ref());
-        out.extend_from_slice(b"=\"");
-        out.extend_from_slice(attr.value.as_ref());
-        out.push(b'"');
-    }
-    if empty {
-        out.extend_from_slice(b"/>");
-    } else {
-        out.push(b'>');
-    }
-}
-
-fn append_end(out: &mut Vec<u8>, e: &BytesEnd<'_>) {
-    out.extend_from_slice(b"</");
-    out.extend_from_slice(e.name().as_ref());
-    out.push(b'>');
 }
 
 fn indexed_row_from_parsed(
@@ -2071,11 +2346,14 @@ fn finding_from_row(
         (row.score, "score")
     };
     let excerpt = match preset {
+        Preset::Animation => animation_excerpt(&row.flat_text),
         Preset::Cpu => format!("cpu={} {}", format_cpu_weight(score, unit), row.flat_text),
+        Preset::Health => health_excerpt(&row.flat_text),
         Preset::Memory => memory_excerpt(&row.flat_text),
         Preset::CpuCounters => counter_excerpt(&row.flat_text),
         Preset::Poi => poi_excerpt(&row.flat_text),
         Preset::ThreadState => thread_state_excerpt(&row.flat_text),
+        Preset::Ui => ui_excerpt(&row.flat_text),
         _ => row.flat_text.clone(),
     };
     Finding {
@@ -2120,6 +2398,15 @@ fn severity_for_preset(preset: Preset, row: &IndexedRow, score: f64, unit: &str)
                 "low"
             }
         }
+        Preset::Animation => {
+            if row.time_ms_hint.unwrap_or(0.0) >= 500.0 || score >= 20_000.0 {
+                "high"
+            } else if row.time_ms_hint.unwrap_or(0.0) >= 100.0 || score >= 2_000.0 {
+                "medium"
+            } else {
+                "low"
+            }
+        }
         Preset::Memory => {
             let live = numeric_attr(
                 &row.flat_text,
@@ -2134,10 +2421,34 @@ fn severity_for_preset(preset: Preset, row: &IndexedRow, score: f64, unit: &str)
                 "low"
             }
         }
+        Preset::Health => {
+            let text = row.flat_text.to_ascii_lowercase();
+            if contains_any(
+                &text,
+                &["critical", "fatal", "watchdog", "crash", "terminated"],
+            ) {
+                "high"
+            } else if contains_any(&text, &["fault", "error", "hang", "pressure", "serious"])
+                || score >= 10_000.0
+            {
+                "medium"
+            } else {
+                "low"
+            }
+        }
         Preset::ThreadState => {
             if row.time_ms_hint.unwrap_or(0.0) >= 1000.0 {
                 "high"
             } else if row.time_ms_hint.unwrap_or(0.0) >= 100.0 {
+                "medium"
+            } else {
+                "low"
+            }
+        }
+        Preset::Ui => {
+            if row.time_ms_hint.unwrap_or(0.0) >= 250.0 || score >= 12_000.0 {
+                "high"
+            } else if row.time_ms_hint.unwrap_or(0.0) >= 50.0 || score >= 1_500.0 {
                 "medium"
             } else {
                 "low"
@@ -2193,6 +2504,19 @@ fn interpretation_hints(finding: &Finding) -> Vec<String> {
     if text.contains("swiftui") || text.contains("layout") || text.contains("render") {
         hints.push("SwiftUI/render evidence: check update fanout, identity churn, animation frequency, and expensive body work".to_string());
     }
+    if text.contains("animation") || text.contains("hitch") || text.contains("frame") {
+        hints.push("animation evidence: correlate frame hitches with main-thread layout/render and repeated state updates".to_string());
+    }
+    if text.contains("runloop") || text.contains("uikit") || text.contains("appkit") {
+        hints.push("UI event-loop evidence: look for synchronous work blocking input, layout, or display commits".to_string());
+    }
+    if text.contains("watchdog")
+        || text.contains("thermal")
+        || text.contains("pressure")
+        || text.contains("diagnostic")
+    {
+        hints.push("health evidence: correlate issue severity with CPU, memory, hangs, and OSLog timestamps".to_string());
+    }
     if text.contains("alloc") || text.contains("vm:") || text.contains("imageio") {
         hints.push(
             "memory evidence: inspect retained/transient allocation classes before assuming a leak"
@@ -2237,7 +2561,15 @@ fn validate_trace(trace: &Path) -> Result<()> {
 fn default_next_commands(trace: &Path) -> Vec<String> {
     vec![
         format!(
-            "aitrace summary {} --preset cpu --target <AppName> --budget 1200",
+            "aitrace summary {} --preset animation --target <AppName> --run latest --budget 1000",
+            shell_quote(trace)
+        ),
+        format!(
+            "aitrace summary {} --preset ui --target <AppName> --run latest --budget 1000",
+            shell_quote(trace)
+        ),
+        format!(
+            "aitrace summary {} --preset cpu --target <AppName> --run latest --budget 1200",
             shell_quote(trace)
         ),
         format!(
@@ -2315,30 +2647,45 @@ fn score_row_for_preset(
 ) -> f64 {
     let base = score_row(percent, time_ms, row_index);
     match preset {
+        Preset::Animation => animation_score(text, percent, time_ms).unwrap_or(base),
         Preset::Memory => memory_score(text).unwrap_or(base),
+        Preset::Health => health_score(text, percent, time_ms).unwrap_or(base),
         Preset::CpuCounters => counter_score(text).unwrap_or(base),
         Preset::ThreadState => time_ms.unwrap_or(base),
         Preset::Poi => time_ms.unwrap_or(base),
+        Preset::Ui => ui_score(text, percent, time_ms).unwrap_or(base),
         _ => base,
     }
 }
 
 fn symbol_hint_for_preset(preset: Preset, text: &str) -> Option<String> {
     match preset {
+        Preset::Animation => animation_title_hint(text).or_else(|| symbol_hint(text)),
         Preset::Energy => process_hint(text).or_else(|| symbol_hint(text)),
+        Preset::Health => health_title_hint(text).or_else(|| symbol_hint(text)),
         Preset::Memory => memory_title_hint(text).or_else(|| symbol_hint(text)),
         Preset::CpuCounters => counter_title_hint(text).or_else(|| symbol_hint(text)),
         Preset::Poi => poi_title_hint(text).or_else(|| symbol_hint(text)),
         Preset::ThreadState => thread_state_title_hint(text).or_else(|| symbol_hint(text)),
+        Preset::Ui => ui_title_hint(text).or_else(|| symbol_hint(text)),
         _ => symbol_hint(text).map(|symbol| normalize_swift_symbol(&symbol)),
     }
 }
 
 fn module_hint_for_preset(preset: Preset, text: &str) -> Option<String> {
     match preset {
+        Preset::Animation => attr_value(text, "process")
+            .or_else(|| attr_value(text, "subsystem"))
+            .or_else(|| module_hint(text)),
         Preset::Energy => pid_hint(text).or_else(|| module_hint(text)),
+        Preset::Health => process_hint(text)
+            .or_else(|| attr_value(text, "process"))
+            .or_else(|| module_hint(text)),
         Preset::Memory => byte_total_label(text).or_else(|| module_hint(text)),
         Preset::CpuCounters => attr_value(text, "process").or_else(|| module_hint(text)),
+        Preset::Ui => attr_value(text, "process")
+            .or_else(|| attr_value(text, "subsystem"))
+            .or_else(|| module_hint(text)),
         _ => module_hint(text),
     }
 }
@@ -2403,9 +2750,125 @@ fn counter_values(text: &str) -> Vec<f64> {
         .collect()
 }
 
+fn animation_score(text: &str, percent: Option<f64>, time_ms: Option<f64>) -> Option<f64> {
+    let lower = text.to_ascii_lowercase();
+    let mut score = time_ms.unwrap_or(0.0) + percent.unwrap_or(0.0) * 100.0;
+    if contains_any(&lower, &["hitch", "jank", "dropped", "missed", "stutter"]) {
+        score += 10_000.0;
+    }
+    if contains_any(&lower, &["animation", "core-animation", "cadisplaylink"]) {
+        score += 1_000.0;
+    }
+    if contains_any(
+        &lower,
+        &["main thread", "main-thread", "com.apple.main-thread"],
+    ) {
+        score += 500.0;
+    }
+    for key in [
+        "dropped-frame-count",
+        "dropped-frames",
+        "missed-frame-count",
+        "hitch-count",
+        "frame-count",
+    ] {
+        if let Some(value) = numeric_attr(text, &[key]) {
+            score += value * 250.0;
+        }
+    }
+    if score > 0.0 {
+        Some(score)
+    } else {
+        None
+    }
+}
+
+fn health_score(text: &str, percent: Option<f64>, time_ms: Option<f64>) -> Option<f64> {
+    let lower = text.to_ascii_lowercase();
+    let mut score = if lower.contains("thermal-state=nominal") {
+        1.0
+    } else {
+        time_ms.unwrap_or(0.0) + percent.unwrap_or(0.0) * 100.0
+    };
+    if contains_any(
+        &lower,
+        &["critical", "fatal", "watchdog", "crash", "terminated"],
+    ) {
+        score += 100_000.0;
+    }
+    if contains_any(
+        &lower,
+        &["fault", "error", "hang", "stalled", "pressure", "serious"],
+    ) {
+        score += 10_000.0;
+    }
+    if contains_any(&lower, &["warning", "issue", "diagnostic", "risk"]) {
+        score += 1_000.0;
+    }
+    for key in ["count", "event-count", "sample-count", "issue-count"] {
+        if let Some(value) = numeric_attr(text, &[key]) {
+            score += value * 50.0;
+        }
+    }
+    if score > 0.0 {
+        Some(score)
+    } else {
+        None
+    }
+}
+
+fn ui_score(text: &str, percent: Option<f64>, time_ms: Option<f64>) -> Option<f64> {
+    let lower = text.to_ascii_lowercase();
+    let mut score = time_ms.unwrap_or(0.0) + percent.unwrap_or(0.0) * 100.0;
+    if contains_any(
+        &lower,
+        &["main thread", "main-thread", "com.apple.main-thread"],
+    ) {
+        score += 2_000.0;
+    }
+    if contains_any(
+        &lower,
+        &["hitch", "hang", "blocked", "stalled", "runloop", "run-loop"],
+    ) {
+        score += 10_000.0;
+    }
+    if contains_any(
+        &lower,
+        &[
+            "swiftui", "uikit", "appkit", "layout", "render", "display", "draw", "view", "body",
+        ],
+    ) {
+        score += 1_000.0;
+    }
+    if score > 0.0 {
+        Some(score)
+    } else {
+        None
+    }
+}
+
 fn memory_title_hint(text: &str) -> Option<String> {
     attr_value(text, "category")
         .or_else(|| attr_value(text, "responsible-caller"))
+        .map(|value| output::truncate_chars(&value, 96))
+}
+
+fn animation_title_hint(text: &str) -> Option<String> {
+    attr_value(text, "name")
+        .or_else(|| attr_value(text, "animation-name"))
+        .or_else(|| attr_value(text, "hitch-type"))
+        .or_else(|| attr_value(text, "event-concept"))
+        .or_else(|| attr_value(text, "category"))
+        .map(|value| output::truncate_chars(&value, 96))
+}
+
+fn health_title_hint(text: &str) -> Option<String> {
+    attr_value(text, "issue")
+        .or_else(|| attr_value(text, "issue-type"))
+        .or_else(|| attr_value(text, "diagnostic"))
+        .or_else(|| attr_value(text, "severity"))
+        .or_else(|| attr_value(text, "name"))
+        .or_else(|| process_hint(text))
         .map(|value| output::truncate_chars(&value, 96))
 }
 
@@ -2430,6 +2893,16 @@ fn thread_state_title_hint(text: &str) -> Option<String> {
         Some(thread) => format!("{} {}", output::truncate_chars(&thread, 48), state),
         None => state,
     })
+}
+
+fn ui_title_hint(text: &str) -> Option<String> {
+    attr_value(text, "name")
+        .or_else(|| attr_value(text, "view"))
+        .or_else(|| attr_value(text, "view-name"))
+        .or_else(|| attr_value(text, "event-concept"))
+        .or_else(|| attr_value(text, "category"))
+        .or_else(|| thread_state_title_hint(text))
+        .map(|value| output::truncate_chars(&value, 96))
 }
 
 fn byte_total_label(text: &str) -> Option<String> {
@@ -2459,6 +2932,65 @@ fn memory_excerpt(text: &str) -> String {
     }
     if let Some(caller) = attr_value(text, "responsible-caller") {
         parts.push(format!("caller={}", output::truncate_chars(&caller, 72)));
+    }
+    if parts.is_empty() {
+        output::truncate_chars(text, 160)
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn animation_excerpt(text: &str) -> String {
+    let mut parts = Vec::new();
+    for key in [
+        "start-time",
+        "timestamp",
+        "time",
+        "duration",
+        "name",
+        "animation-name",
+        "category",
+        "hitch-type",
+        "fps",
+        "frame-rate",
+        "dropped-frame-count",
+        "dropped-frames",
+        "missed-frame-count",
+        "hitch-count",
+    ] {
+        if let Some(value) = attr_value(text, key) {
+            parts.push(format!("{key}={}", output::truncate_chars(&value, 56)));
+        }
+    }
+    if let Some(thread) = thread_hint(text) {
+        parts.push(format!("th={}", output::truncate_chars(&thread, 48)));
+    }
+    if parts.is_empty() {
+        output::truncate_chars(text, 160)
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn health_excerpt(text: &str) -> String {
+    let mut parts = Vec::new();
+    for key in [
+        "severity",
+        "issue",
+        "issue-type",
+        "diagnostic",
+        "name",
+        "process",
+        "responsible-process",
+        "thread",
+        "duration",
+        "thermal-state",
+        "memory-pressure",
+        "event-count",
+    ] {
+        if let Some(value) = attr_value(text, key) {
+            parts.push(format!("{key}={}", output::truncate_chars(&value, 64)));
+        }
     }
     if parts.is_empty() {
         output::truncate_chars(text, 160)
@@ -2537,6 +3069,37 @@ fn thread_state_excerpt(text: &str) -> String {
     }
     if parts.is_empty() {
         output::truncate_chars(text, 160)
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn ui_excerpt(text: &str) -> String {
+    let mut parts = Vec::new();
+    for key in [
+        "start-time",
+        "timestamp",
+        "time",
+        "duration",
+        "name",
+        "view",
+        "view-name",
+        "category",
+        "event-concept",
+        "subsystem",
+        "layout",
+        "render",
+        "runloop",
+    ] {
+        if let Some(value) = attr_value(text, key) {
+            parts.push(format!("{key}={}", output::truncate_chars(&value, 56)));
+        }
+    }
+    if let Some(thread) = thread_hint(text) {
+        parts.push(format!("th={}", output::truncate_chars(&thread, 48)));
+    }
+    if parts.is_empty() {
+        thread_state_excerpt(text)
     } else {
         parts.join(" ")
     }
@@ -2659,7 +3222,13 @@ fn round1(value: f64) -> f64 {
 
 fn score_for_output(preset: Preset, score: f64) -> f64 {
     match preset {
-        Preset::CpuCounters | Preset::Memory | Preset::Poi | Preset::ThreadState => round1(score),
+        Preset::Animation
+        | Preset::CpuCounters
+        | Preset::Health
+        | Preset::Memory
+        | Preset::Poi
+        | Preset::ThreadState
+        | Preset::Ui => round1(score),
         _ => score,
     }
 }
@@ -3184,6 +3753,64 @@ mod tests {
             Some("Deck (7990)".to_string())
         );
         assert_eq!(max_percent(&row.flat_text), Some(77.6));
+    }
+
+    #[test]
+    fn supports_animation_ui_health_presets() {
+        let schemas = vec![
+            SchemaRef {
+                run: "1".to_string(),
+                table_index: 1,
+                schema_name: "animation-hitches".to_string(),
+                name: Some("Animation Hitches".to_string()),
+                documentation: None,
+                suggested_xpath: "/trace-toc/run[@number='1']/data/table[1]".to_string(),
+            },
+            SchemaRef {
+                run: "1".to_string(),
+                table_index: 2,
+                schema_name: "swiftui-update".to_string(),
+                name: Some("SwiftUI Updates".to_string()),
+                documentation: None,
+                suggested_xpath: "/trace-toc/run[@number='1']/data/table[2]".to_string(),
+            },
+            SchemaRef {
+                run: "1".to_string(),
+                table_index: 3,
+                schema_name: "hang-risks".to_string(),
+                name: Some("Health Issues".to_string()),
+                documentation: None,
+                suggested_xpath: "/trace-toc/run[@number='1']/data/table[3]".to_string(),
+            },
+        ];
+
+        let animation = matching_schemas(&schemas, Preset::Animation);
+        let ui = matching_schemas(&schemas, Preset::Ui);
+        let health = matching_schemas(&schemas, Preset::Health);
+        assert!(animation
+            .iter()
+            .any(|schema| schema.schema_name == "animation-hitches"));
+        assert!(ui
+            .iter()
+            .any(|schema| schema.schema_name == "swiftui-update"));
+        assert!(health
+            .iter()
+            .any(|schema| schema.schema_name == "hang-risks"));
+    }
+
+    #[test]
+    fn scores_and_compacts_animation_ui_health_rows() {
+        let animation = "name=CardFlip duration=240.0 ms hitch-count=2 dropped-frame-count=5 thread=Main Thread";
+        let ui =
+            "name=LayoutPass duration=80.0 ms subsystem=SwiftUI runloop=main thread=Main Thread";
+        let health = "severity=critical issue=watchdog duration=1.2 s process=Deck";
+
+        assert!(animation_score(animation, None, max_time_ms(animation)).unwrap() > 10_000.0);
+        assert!(ui_score(ui, None, max_time_ms(ui)).unwrap() > 10_000.0);
+        assert!(health_score(health, None, max_time_ms(health)).unwrap() > 100_000.0);
+        assert!(animation_excerpt(animation).contains("dropped-frame-count=5"));
+        assert!(ui_excerpt(ui).contains("runloop=main"));
+        assert!(health_excerpt(health).contains("severity=critical"));
     }
 
     #[test]

@@ -35,6 +35,7 @@ tmp/
 .idea/
 *.swp
 *.swo
+.cursor
 
 # macOS / filesystem noise
 .DS_Store

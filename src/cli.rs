@@ -262,14 +262,19 @@ pub enum OutputFormat {
 #[serde(rename_all = "kebab-case")]
 pub enum Preset {
     Overview,
+    Animation,
     Cpu,
     CpuCounters,
     Diagnostics,
     Energy,
     Hangs,
+    #[value(alias = "heath")]
+    Health,
     Memory,
     Poi,
     ThreadState,
+    #[value(alias = "uikit")]
+    Ui,
     Oslog,
 }
 
@@ -277,14 +282,17 @@ impl Preset {
     pub fn as_str(self) -> &'static str {
         match self {
             Preset::Overview => "overview",
+            Preset::Animation => "animation",
             Preset::Cpu => "cpu",
             Preset::CpuCounters => "cpu-counters",
             Preset::Diagnostics => "diagnostics",
             Preset::Energy => "energy",
             Preset::Hangs => "hangs",
+            Preset::Health => "health",
             Preset::Memory => "memory",
             Preset::Poi => "poi",
             Preset::ThreadState => "thread-state",
+            Preset::Ui => "ui",
             Preset::Oslog => "oslog",
         }
     }
@@ -292,6 +300,31 @@ impl Preset {
     pub fn schema_needles(self) -> &'static [&'static str] {
         match self {
             Preset::Overview => &[],
+            Preset::Animation => &[
+                "animation",
+                "animations",
+                "core-animation",
+                "core animation",
+                "ca-",
+                "compositor",
+                "display-compositor",
+                "display-surface",
+                "display-link",
+                "displayed-surfaces",
+                "display-vsync",
+                "cadisplaylink",
+                "fps",
+                "hitch",
+                "hitches",
+                "jank",
+                "render-server",
+                "render server",
+                "visual-chain",
+                "visual-connection",
+                "vsync",
+                "swiftui-update",
+                "swiftui-causes",
+            ],
             Preset::Cpu => &[
                 "cpu-profile",
                 "time-profile",
@@ -339,6 +372,22 @@ impl Preset {
                 "swiftui-update",
                 "swiftui-causes",
             ],
+            Preset::Health => &[
+                "health",
+                "runtime-health",
+                "app-health",
+                "hang-risk",
+                "hang-risks",
+                "potential-hangs",
+                "issue",
+                "issues",
+                "diagnostic",
+                "diagnostics",
+                "fault",
+                "thermal",
+                "pressure",
+                "watchdog",
+            ],
             Preset::Memory => &[
                 "allocations",
                 "leaks",
@@ -364,20 +413,39 @@ impl Preset {
                 "thread-snapshot",
                 "thread-state",
             ],
+            Preset::Ui => &[
+                "swiftui",
+                "uikit",
+                "appkit",
+                "layout",
+                "render",
+                "display",
+                "draw",
+                "runloop",
+                "run-loop",
+                "main-thread",
+                "main thread",
+                "hitch",
+                "hitches",
+                "animation",
+            ],
             Preset::Oslog => &["os-log", "signpost", "points-of-interest", "logging"],
         }
     }
 
     pub fn all_index_presets() -> &'static [Preset] {
         &[
+            Preset::Animation,
             Preset::Cpu,
             Preset::CpuCounters,
             Preset::ThreadState,
+            Preset::Ui,
             Preset::Poi,
             Preset::Memory,
             Preset::Diagnostics,
             Preset::Energy,
             Preset::Hangs,
+            Preset::Health,
             Preset::Oslog,
         ]
     }

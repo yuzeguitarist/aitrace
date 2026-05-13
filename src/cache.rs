@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-pub const PARSER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-perf3");
+pub const PARSER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-perf14");
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CacheInfo {
@@ -166,6 +166,8 @@ pub fn open_db(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "cache_size", -64_000)?;
     init_db(&conn)?;
     Ok(conn)
 }
@@ -217,6 +219,8 @@ fn init_db(conn: &Connection) -> Result<()> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_rows_preset_score ON rows(preset, score DESC);
+        CREATE INDEX IF NOT EXISTS idx_rows_preset_run_score ON rows(preset, run, score DESC);
+        CREATE INDEX IF NOT EXISTS idx_rows_preset_run_row ON rows(preset, run, row_index);
         CREATE INDEX IF NOT EXISTS idx_rows_schema ON rows(schema_name);
         CREATE INDEX IF NOT EXISTS idx_rows_table ON rows(run, table_index, row_index);
         "#,
@@ -280,7 +284,7 @@ pub fn insert_raw_fragment(
     row_index: Option<usize>,
     xml: &[u8],
 ) -> Result<()> {
-    let compressed = zstd::stream::encode_all(xml, 6)?;
+    let compressed = zstd::stream::encode_all(xml, 1)?;
     conn.execute(
         r#"
         INSERT OR REPLACE INTO raw_fragments(
@@ -303,8 +307,8 @@ pub fn insert_raw_fragment(
     Ok(())
 }
 
-pub fn insert_row(conn: &Connection, row: &IndexedRow) -> Result<()> {
-    conn.execute(
+pub fn insert_rows(conn: &Connection, rows: &[IndexedRow]) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
         r#"
         INSERT OR REPLACE INTO rows(
             evidence_id, preset, run, table_index, schema_name, row_index,
@@ -312,7 +316,9 @@ pub fn insert_row(conn: &Connection, row: &IndexedRow) -> Result<()> {
         )
         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         "#,
-        params![
+    )?;
+    for row in rows {
+        stmt.execute(params![
             row.evidence_id,
             row.preset,
             row.run,
@@ -326,8 +332,8 @@ pub fn insert_row(conn: &Connection, row: &IndexedRow) -> Result<()> {
             row.percent_hint,
             row.time_ms_hint,
             row.flat_text
-        ],
-    )?;
+        ])?;
+    }
     Ok(())
 }
 

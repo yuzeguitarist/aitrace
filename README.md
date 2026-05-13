@@ -23,7 +23,7 @@ This repository contains the first CLI version:
 - `aitrace diagnose`
 - `aitrace inspect`
 - `aitrace index`
-- `aitrace summary --preset cpu|cpu-counters|thread-state|poi|diagnostics|energy|hangs|memory|oslog`
+- `aitrace summary --preset animation|cpu|cpu-counters|thread-state|ui|poi|diagnostics|energy|hangs|health|memory|oslog`
 - `aitrace find`
 - `aitrace drill`
 - `aitrace raw`
@@ -94,6 +94,14 @@ For Energy Organizer / Activity Monitor style traces:
 aitrace summary Deck.trace --preset energy --target Deck --run latest --budget 1600
 ```
 
+For Animation Hitches / UI responsiveness traces:
+
+```bash
+aitrace summary Deck.trace --preset animation --target Deck --run latest --budget 1200
+aitrace summary Deck.trace --preset ui --target Deck --run latest --budget 1200
+aitrace summary Deck.trace --preset health --target Deck --run latest --budget 1200
+```
+
 For CPU Bottlenecks templates that contain CPU Counters, Time Profiler, Thread
 State Trace, and Points of Interest, use separate compact summaries instead of
 one giant mixed export:
@@ -148,12 +156,15 @@ When analyzing Apple Instruments `.trace` bundles:
    `aitrace inspect TRACE.trace --format ai-yaml`.
 5. Use targeted follow-up summaries, usually with `--run latest`:
    - `aitrace summary TRACE.trace --preset cpu --target APP --run latest --budget 1200`
+   - `aitrace summary TRACE.trace --preset animation --target APP --run latest --budget 1200`
+   - `aitrace summary TRACE.trace --preset ui --target APP --run latest --budget 1200`
    - `aitrace summary TRACE.trace --preset cpu-counters --target APP --run latest --budget 1200`
    - `aitrace summary TRACE.trace --preset thread-state --target APP --run latest --budget 1200`
    - `aitrace summary TRACE.trace --preset poi --target APP --run latest --budget 1200`
    - `aitrace summary TRACE.trace --preset diagnostics --target APP --run latest --budget 1600`
    - `aitrace summary TRACE.trace --preset energy --target APP --run latest --budget 1600`
    - `aitrace summary TRACE.trace --preset hangs --target APP --run latest --budget 1200`
+   - `aitrace summary TRACE.trace --preset health --target APP --run latest --budget 1200`
    - `aitrace summary TRACE.trace --preset memory --target APP --run latest --budget 1200`
 6. Use `aitrace find`, `aitrace drill`, and `aitrace raw` only with symbols,
    finding IDs, or evidence IDs produced by `aitrace`.

@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-pub const PARSER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-perf14");
+pub const PARSER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-perf15");
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CacheInfo {
